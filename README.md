@@ -4,10 +4,11 @@ A Python-based web scraper for downloading novels from various sources and conve
 
 ## Features
 
-- Scrapes novels from **novelbin.com** (supports both simple and title-based URLs)
+- Scrapes novels from **freewebnovel.com** (primary, no Cloudflare)
+- Scrapes novels from **novelbin.com** (requires cloudscraper for Cloudflare bypass)
 - Outputs **Obsidian-compatible** markdown with YAML frontmatter and tags
 - Creates **index files** with wikilinks to all chapters
-- Handles anti-bot protection using `cloudscraper`
+- **CLI interface** with URL parameters
 - Automatic retry on failures
 - Progress tracking and error reporting
 
@@ -28,176 +29,99 @@ uv sync
 
 ## Quick Start
 
-### Method 1: Simple URL Format (numbered chapters)
+### Command Line Interface (Recommended)
 
-For novels with simple chapter URLs like `/chapter-1`, `/chapter-2`:
+```bash
+# Basic usage
+uv run python scrape_novels.py --url URL --name "Novel Name" --end CHAPTERS
+
+# Example: Scrape a novel from freewebnovel.com
+uv run python scrape_novels.py \
+  --url "https://freewebnovel.com/my-vampire-system.html" \
+  --name "My Vampire System" \
+  --end 2545
+
+# With all options
+uv run python scrape_novels.py \
+  --url "https://freewebnovel.com/rezero-kara-hajimeru-isekai-seikatsu-wn.html" \
+  --name "Re Zero WN" \
+  --start 1 \
+  --end 549 \
+  --output novels_obsidian \
+  --delay 1.5
+```
+
+### CLI Options
+
+| Option | Short | Required | Default | Description |
+|--------|-------|----------|---------|-------------|
+| `--url` | `-u` | Yes | - | Novel URL from freewebnovel.com |
+| `--name` | `-n` | Yes | - | Novel name (used for folder and tags) |
+| `--end` | `-e` | Yes | - | Last chapter number to scrape |
+| `--start` | `-s` | No | 1 | First chapter number to scrape |
+| `--output` | `-o` | No | novels_obsidian | Output directory |
+| `--delay` | `-d` | No | 1.5 | Delay between requests (seconds) |
+
+### Python API
+
+```python
+from scrape_novels import FreeWebNovelScraper
+
+scraper = FreeWebNovelScraper(output_dir="novels_obsidian")
+scraper.scrape_range(
+    novel_slug="my-vampire-system",
+    novel_name="My Vampire System",
+    start_chapter=1,
+    end_chapter=2545,
+    delay=1.5
+)
+```
+
+### For novelbin.com (Cloudflare protected)
 
 ```python
 from scrape_novels import NovelBinScraper
 
 scraper = NovelBinScraper(output_dir="novels_obsidian")
+
+# Simple URL format (/chapter-1, /chapter-2)
 scraper.scrape_range(
     novel_slug="my-werewolf-system-novel",
     novel_name="My Werewolf System",
     start_chapter=1,
     end_chapter=325,
-    delay=2  # seconds between requests
+    delay=2
 )
-```
 
-### Method 2: Title-Based URLs (chapter list)
-
-For novels with title-based URLs like `/chapter-1-the-beginning`:
-
-```python
-from scrape_novels import NovelBinScraper
-
-scraper = NovelBinScraper(output_dir="novels_obsidian")
+# Title-based URLs (/chapter-1-the-beginning)
 scraper.scrape_with_chapter_list(
     novel_slug="shadow-slave",
     novel_name="Shadow Slave",
     start_chapter=1,
-    end_chapter=None,  # None = all available
     delay=2
 )
 ```
 
-### Running from Command Line
+## Supported Sites
 
-```bash
-# Run the main script
-uv run python scrape_novels.py
-
-# Or run a custom script
-uv run python -c "
-from scrape_novels import NovelBinScraper
-scraper = NovelBinScraper(output_dir='novels_obsidian')
-scraper.scrape_range('novel-slug', 'Novel Name', 1, 100, delay=2)
-"
-```
-
-## How It Works
-
-### Flowchart
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                        START                                     │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  1. INITIALIZE SCRAPER                                          │
-│     - Create cloudscraper session                               │
-│     - Set browser headers                                       │
-│     - Configure output directory                                │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  2. DETERMINE URL TYPE                                          │
-│     ┌──────────────────┬──────────────────┐                     │
-│     │  Simple URLs?    │  Title-based?    │                     │
-│     │  /chapter-1      │  /chapter-1-xxx  │                     │
-│     └────────┬─────────┴────────┬─────────┘                     │
-│              │                  │                               │
-│              ▼                  ▼                               │
-│     scrape_range()    scrape_with_chapter_list()               │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-          ┌───────────────────┴───────────────────┐
-          ▼                                       ▼
-┌─────────────────────┐             ┌─────────────────────────────┐
-│ Simple URL Mode     │             │ Chapter List Mode           │
-│                     │             │                             │
-│ Generate URL:       │             │ 1. Fetch AJAX chapter list  │
-│ /b/{slug}/chapter-N │             │ 2. Parse all chapter URLs   │
-│                     │             │ 3. Extract chapter numbers  │
-└─────────┬───────────┘             └──────────────┬──────────────┘
-          │                                        │
-          └────────────────┬───────────────────────┘
-                           ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  3. FOR EACH CHAPTER                                            │
-│     ┌─────────────────────────────────────────────────────┐     │
-│     │  a. Request chapter URL                             │     │
-│     │  b. Parse HTML with BeautifulSoup                   │     │
-│     │  c. Extract title from selectors                    │     │
-│     │  d. Extract content from #chr-content               │     │
-│     │  e. Filter out navigation/ad text                   │     │
-│     │  f. Retry up to 3 times on failure                  │     │
-│     └─────────────────────────────────────────────────────┘     │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  4. SAVE CHAPTER (Obsidian Format)                              │
-│     ┌─────────────────────────────────────────────────────┐     │
-│     │  Filename: 0001 - Novel Name.md                     │     │
-│     │                                                     │     │
-│     │  Content:                                           │     │
-│     │  ---                                                │     │
-│     │  tags:                                              │     │
-│     │    - book/novel                                     │     │
-│     │    - novel-name-slug                                │     │
-│     │  ---                                                │     │
-│     │  # Novel Name                                       │     │
-│     │  **Novel:** Novel Name                              │     │
-│     │  **Chapter:** 1                                     │     │
-│     │  ---                                                │     │
-│     │  [chapter content]                                  │     │
-│     └─────────────────────────────────────────────────────┘     │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  5. DELAY (default 2 seconds)                                   │
-│     - Respect server rate limits                                │
-│     - Avoid getting blocked                                     │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-                    ┌─────────────────┐
-                    │ More chapters?  │
-                    └────────┬────────┘
-                             │
-              ┌──────────────┴──────────────┐
-              │ YES                         │ NO
-              ▼                             ▼
-     [Go back to step 3]    ┌─────────────────────────────────────┐
-                            │  6. CREATE INDEX FILE               │
-                            │     - Generate Table of Contents    │
-                            │     - Add Obsidian wikilinks        │
-                            │     - Save as Novel_Name_Index.md   │
-                            └─────────────────────────────────────┘
-                                            │
-                                            ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  7. PRINT SUMMARY                                               │
-│     - Successful chapters count                                 │
-│     - Failed chapters list                                      │
-│     - Output folder location                                    │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                          END                                     │
-└─────────────────────────────────────────────────────────────────┘
-```
+| Site | Cloudflare | Scraper Class | Notes |
+|------|------------|---------------|-------|
+| freewebnovel.com | No | `FreeWebNovelScraper` | Recommended, faster |
+| novelbin.com | Yes | `NovelBinScraper` | May get blocked |
 
 ## Output Structure
 
 ```
 novels_obsidian/
-├── My Werewolf System/
-│   ├── 0001 - My Werewolf System.md
-│   ├── 0002 - My Werewolf System.md
+├── My Vampire System/
+│   ├── 0001 - My Vampire System.md
+│   ├── 0002 - My Vampire System.md
 │   ├── ...
-│   └── My_Werewolf_System_Index.md
-├── Shadow Slave/
-│   ├── 0001 - Shadow Slave.md
+│   └── My_Vampire_System_Index.md
+├── Re Zero WN/
+│   ├── 0001 - Re Zero Wn.md
 │   ├── ...
-│   └── Shadow_Slave_Index.md
+│   └── Re_Zero_Wn_Index.md
 └── ...
 ```
 
@@ -209,12 +133,12 @@ Each chapter file follows the Obsidian format:
 ---
 tags:
   - book/novel
-  - my-werewolf-system
+  - my-vampire-system
 ---
 
-# My Werewolf System
+# My Vampire System
 
-**Novel:** My Werewolf System
+**Novel:** My Vampire System
 
 **Chapter:** 1
 
@@ -231,77 +155,55 @@ The index file contains a Table of Contents with Obsidian wikilinks:
 ---
 tags:
   - book/novel
-  - my-werewolf-system
+  - my-vampire-system
 ---
 
-# My Werewolf System
+# My Vampire System
 
 ## Table of Contents
 ---
 
-- [Chapter 1](#chapter-1) -> [[0001_-_My_Werewolf_System]]
-- [Chapter 2](#chapter-2) -> [[0002_-_My_Werewolf_System]]
-- [Chapter 3](#chapter-3) -> [[0003_-_My_Werewolf_System]]
+- [Chapter 1](#chapter-1) -> [[0001_-_My_Vampire_System]]
+- [Chapter 2](#chapter-2) -> [[0002_-_My_Vampire_System]]
 ...
 ```
 
-## Finding Novel Slugs
+## Finding Novel URLs
 
-The novel slug is the URL path identifier. For example:
+### freewebnovel.com
+1. Search for the novel on the site
+2. Copy the URL: `https://freewebnovel.com/novel-name.html`
+3. Check the last chapter number on the novel page
 
-| URL | Slug |
-|-----|------|
-| `novelbin.com/b/my-werewolf-system-novel` | `my-werewolf-system-novel` |
-| `novelbin.com/b/shadow-slave` | `shadow-slave` |
-| `novelbin.com/b/the-beginning-after-the-end` | `the-beginning-after-the-end` |
-
-## Determining URL Type
-
-1. **Check a chapter URL manually:**
-   - Simple: `novelbin.com/b/novel-slug/chapter-1`
-   - Title-based: `novelbin.com/b/novel-slug/chapter-1-the-beginning`
-
-2. **Test with the scraper:**
-   ```python
-   # If this returns content, use scrape_range()
-   scraper.scrape_chapter('novel-slug', 1)
-
-   # If empty, use scrape_with_chapter_list()
-   scraper.scrape_with_chapter_list('novel-slug', 'Novel Name', 1)
-   ```
-
-## Converting Existing Novels
-
-To convert existing novel folders to Obsidian format:
-
-```bash
-uv run python convert_to_obsidian.py
-```
-
-## Troubleshooting
-
-### 403 Forbidden Errors
-The scraper uses `cloudscraper` to bypass anti-bot protection. If you still get 403 errors:
-- Increase delay between requests
-- The site may have changed its protection
-
-### Empty Content
-Some chapters may return empty content if:
-- The chapter doesn't exist on the site
-- The site returns a placeholder page
-- Check if the novel uses title-based URLs
-
-### Missing Chapters
-- Some novels have gaps in chapter numbers
-- Use `scrape_with_chapter_list()` to get only available chapters
+### novelbin.com
+1. Navigate to the novel page
+2. Copy the slug from URL: `novelbin.com/b/novel-slug`
 
 ## Files
 
 | File | Description |
 |------|-------------|
-| `scrape_novels.py` | Main scraper with `NovelBinScraper` class |
+| `scrape_novels.py` | Main scraper with CLI and scraper classes |
+| `main.py` | Interactive scraper for freewebnovel.com with offset detection |
 | `convert_to_obsidian.py` | Convert existing folders to Obsidian format |
 | `test_scrape.py` | Test script for verifying scraper works |
+
+## Troubleshooting
+
+### 403 Forbidden Errors
+- **freewebnovel.com**: Usually works without issues
+- **novelbin.com**: Uses Cloudflare protection, may get blocked
+  - Try increasing delay between requests
+  - Site may have updated protection
+
+### Empty Content
+- The chapter may not exist on the site
+- Check if you're using the correct URL format
+- Some chapters may be premium/locked
+
+### Missing Chapters
+- Some novels have gaps in chapter numbers
+- The site may not have all chapters available
 
 ## License
 

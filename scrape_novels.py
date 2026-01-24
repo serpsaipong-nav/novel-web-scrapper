@@ -382,18 +382,149 @@ class NovelBinScraper(NovelScraper):
         return successful, failed
 
 
+class FreeWebNovelScraper(NovelScraper):
+    """Scraper for freewebnovel.com - no Cloudflare issues"""
+
+    def __init__(self, output_dir="novels"):
+        super().__init__(output_dir)
+        self.base_url = "https://freewebnovel.com"
+
+    def get_chapter_url(self, novel_slug, chapter_num):
+        """Generate chapter URL"""
+        return f"{self.base_url}/novel/{novel_slug}/chapter-{chapter_num}"
+
+    def scrape_chapter(self, novel_slug, chapter_num, retries=3):
+        """Scrape a single chapter"""
+        url = self.get_chapter_url(novel_slug, chapter_num)
+
+        for attempt in range(retries):
+            try:
+                response = self.scraper.get(url, timeout=30)
+
+                if response.status_code == 200:
+                    soup = BeautifulSoup(response.content, 'html.parser')
+
+                    # Get title
+                    title = f"Chapter {chapter_num}"
+                    title_elem = soup.select_one('h1.tit, .chapter-title, h1')
+                    if title_elem:
+                        title = title_elem.get_text(strip=True)
+
+                    # Get content - freewebnovel uses paragraphs directly
+                    content_parts = []
+                    paragraphs = soup.find_all('p')
+
+                    for p in paragraphs:
+                        text = p.get_text(strip=True)
+                        if len(text) > 15:
+                            skip_phrases = [
+                                'prev chapter', 'next chapter', 'use arrow keys',
+                                'report chapter', 'freewebnovel.com', 'contact',
+                                'sitemap', 'privacy policy', 'log in', 'create account',
+                                'tap the screen', 'add to library', 'submit', 'comments',
+                                'welcome to freewebnovel', "don't have an account"
+                            ]
+                            if not any(skip in text.lower() for skip in skip_phrases):
+                                content_parts.append(text)
+
+                    if content_parts:
+                        content = '\n\n'.join(content_parts)
+                        if len(content) > 100:
+                            return title, content
+
+                elif response.status_code == 404:
+                    return None, None
+
+            except Exception as e:
+                if attempt < retries - 1:
+                    print(f"  (attempt {attempt+1}) Error: {str(e)[:50]}")
+
+            if attempt < retries - 1:
+                time.sleep(2)
+
+        return None, None
+
+    def scrape_range(self, novel_slug, novel_name, start_chapter, end_chapter, delay=1.5):
+        """Scrape a range of chapters"""
+        folder_name = self.get_folder_name(novel_name)
+
+        print(f"\n{'='*60}")
+        print(f"Scraping: {folder_name}")
+        print(f"Source: freewebnovel.com")
+        print(f"Chapters: {start_chapter} to {end_chapter}")
+        print(f"{'='*60}\n")
+
+        self.chapters_saved = []
+        successful = 0
+        failed = 0
+        failed_chapters = []
+
+        for chapter_num in range(start_chapter, end_chapter + 1):
+            print(f"[{chapter_num}/{end_chapter}] Chapter {chapter_num}...", end=" ", flush=True)
+
+            title, content = self.scrape_chapter(novel_slug, chapter_num)
+
+            if content:
+                self.save_chapter(novel_name, chapter_num, title, content)
+                print(f"OK ({len(content)} chars)")
+                successful += 1
+            else:
+                print("FAILED")
+                failed += 1
+                failed_chapters.append(chapter_num)
+
+            if chapter_num < end_chapter:
+                time.sleep(delay)
+
+        # Create index file
+        if successful > 0:
+            self.create_index_file(novel_name)
+
+        print(f"\n{'='*60}")
+        print(f"Complete: {successful} successful, {failed} failed")
+        print(f"Output folder: {folder_name}")
+        if failed_chapters:
+            print(f"Failed chapters: {failed_chapters[:20]}{'...' if len(failed_chapters) > 20 else ''}")
+        print(f"{'='*60}")
+
+        return successful, failed
+
+
 def main():
+    """CLI interface for scraping novels"""
+    import argparse
+
+    parser = argparse.ArgumentParser(description='Novel Scraper for Obsidian')
+    parser.add_argument('--url', '-u', required=True, help='Novel URL (freewebnovel.com)')
+    parser.add_argument('--name', '-n', required=True, help='Novel name for folder/tags')
+    parser.add_argument('--start', '-s', type=int, default=1, help='Start chapter (default: 1)')
+    parser.add_argument('--end', '-e', type=int, required=True, help='End chapter')
+    parser.add_argument('--output', '-o', default='novels_obsidian', help='Output directory (default: novels_obsidian)')
+    parser.add_argument('--delay', '-d', type=float, default=1.5, help='Delay between requests (default: 1.5)')
+
+    args = parser.parse_args()
+
+    # Extract slug from URL
+    # Supports: https://freewebnovel.com/novel-name.html or https://freewebnovel.com/novel/novel-name/...
+    slug = args.url.rstrip('/').split('/')[-1].replace('.html', '')
+    if slug.startswith('chapter-'):
+        slug = args.url.rstrip('/').split('/')[-2]
+
     print("="*60)
-    print("Novel Scraper for Obsidian (cloudscraper)")
+    print("Novel Scraper for Obsidian")
+    print(f"Novel: {args.name}")
+    print(f"Slug: {slug}")
+    print(f"Chapters: {args.start} to {args.end}")
+    print(f"Output: {args.output}")
     print("="*60)
 
-    # Example usage with chapter list (title-based URLs)
-    scraper = NovelBinScraper(output_dir="novels_obsidian")
-    scraper.scrape_with_chapter_list(
-        novel_slug="shadow-slave",
-        novel_name="Shadow Slave",
-        start_chapter=1,
-        delay=2
+    scraper = FreeWebNovelScraper(output_dir=args.output)
+    scraper.scrape_range(
+        novel_slug=slug,
+        novel_name=args.name,
+        start_chapter=args.start,
+        end_chapter=args.end,
+        delay=args.delay
     )
 
 

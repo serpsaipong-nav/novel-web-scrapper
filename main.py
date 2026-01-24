@@ -25,6 +25,9 @@ class OffsetAwareScraper:
             'my dragon system': 'https://freewebnovel.com/novel/my-dragon-system/chapter-{chapter}',
             'my vampire system': 'https://freewebnovel.com/novel/my-vampire-system/chapter-{chapter}',
             'my werewolf system': 'https://freewebnovel.com/novel/my-werewolf-system/chapter-{chapter}',
+            'rezero kara hajimeru isekai seikatsu wn': 'https://freewebnovel.com/novel/rezero-kara-hajimeru-isekai-seikatsu-wn/chapter-{chapter}',
+            'rezero all sins': 'https://freewebnovel.com/novel/rezero-all-sins/chapter-{chapter}',
+            'reincarnated with the strongest system': 'https://freewebnovel.com/novel/reincarnated-with-the-strongest-system/chapter-{chapter}',
         }
         
         self.url_pattern = self.get_novel_url(novel_name)
