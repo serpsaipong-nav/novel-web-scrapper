@@ -1,30 +1,427 @@
 #!/usr/bin/env python3
 """
-Multi-site Novel Scraper using cloudscraper
-Supports: novelbin.me/novelbin.com (both simple and title-based URLs)
-          webnovel.com (using Selenium for JavaScript rendering)
-          lightnovelstranslations.com
-          freewebnovel.com
-Outputs Obsidian-compatible markdown with tags and index
+Multi-site Novel Scraper with DuckDB tracking and Obsidian integration.
+
+Supports: lightnovelstranslations.com, freewebnovel.com, webnovel.com, novelbin.com
+Features: Parallel downloads, state tracking, Obsidian vault sync, n8n automation ready
+
+Commands:
+    add         Add a novel to track
+    list        List all tracked novels
+    check       Check for new chapters
+    sync        Download new chapters
+    move        Move chapters to Obsidian vault
+    scan-obsidian  Import existing novels from Obsidian
+    config      View/set configuration
+    scrape      Legacy: scrape chapters directly (one-time)
 """
 
 import os
 import re
+import sys
+import json
 import time
+import shutil
+import random
+import tomllib
+import argparse
+import threading
+from pathlib import Path
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import duckdb
 import cloudscraper
 from bs4 import BeautifulSoup
-from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from webdriver_manager.chrome import ChromeDriverManager
 
+# Optional Selenium imports (for webnovel.com)
+try:
+    from selenium import webdriver
+    from selenium.webdriver.chrome.service import Service
+    from selenium.webdriver.chrome.options import Options
+    from webdriver_manager.chrome import ChromeDriverManager
+    SELENIUM_AVAILABLE = True
+except ImportError:
+    SELENIUM_AVAILABLE = False
+
+
+# =============================================================================
+# Configuration
+# =============================================================================
+
+class Config:
+    """Configuration manager with TOML support"""
+
+    DEFAULT_CONFIG = {
+        'paths': {
+            'staging_dir': 'novels_obsidian',
+            'obsidian_vault': '',
+            'database': 'novels.db',
+        },
+        'scraper': {
+            'delay': 1.5,
+            'max_workers': 4,
+            'max_retries': 3,
+            'parallel_delay_multiplier': 2.0,
+        },
+        'notifications': {
+            'enabled': False,
+            'discord_webhook': '',
+            'telegram_bot_token': '',
+            'telegram_chat_id': '',
+        }
+    }
+
+    def __init__(self, config_dir=None):
+        self.config_dir = Path(config_dir) if config_dir else Path.cwd()
+        self.config_file = self.config_dir / 'config.toml'
+        self.local_config_file = self.config_dir / 'config.local.toml'
+        self._config = None
+
+    def load(self):
+        """Load configuration from TOML files"""
+        config = self.DEFAULT_CONFIG.copy()
+
+        # Deep copy nested dicts
+        for key in config:
+            if isinstance(config[key], dict):
+                config[key] = config[key].copy()
+
+        # Load base config
+        if self.config_file.exists():
+            with open(self.config_file, 'rb') as f:
+                base = tomllib.load(f)
+                self._merge_config(config, base)
+
+        # Load local overrides
+        if self.local_config_file.exists():
+            with open(self.local_config_file, 'rb') as f:
+                local = tomllib.load(f)
+                self._merge_config(config, local)
+
+        self._config = config
+        return config
+
+    def _merge_config(self, base, override):
+        """Deep merge override into base"""
+        for key, value in override.items():
+            if key in base and isinstance(base[key], dict) and isinstance(value, dict):
+                self._merge_config(base[key], value)
+            else:
+                base[key] = value
+
+    def get(self, section, key, default=None):
+        """Get a config value"""
+        if self._config is None:
+            self.load()
+        return self._config.get(section, {}).get(key, default)
+
+    def set(self, section, key, value):
+        """Set a config value in local config"""
+        # Load existing local config or create new
+        local_config = {}
+        if self.local_config_file.exists():
+            with open(self.local_config_file, 'rb') as f:
+                local_config = tomllib.load(f)
+
+        # Set value
+        if section not in local_config:
+            local_config[section] = {}
+        local_config[section][key] = value
+
+        # Write back (convert to TOML format)
+        self._write_toml(self.local_config_file, local_config)
+
+        # Reload config
+        self._config = None
+        self.load()
+
+    def _write_toml(self, path, config):
+        """Write config dict to TOML file"""
+        lines = []
+        for section, values in config.items():
+            lines.append(f'[{section}]')
+            for key, value in values.items():
+                if isinstance(value, str):
+                    lines.append(f'{key} = "{value}"')
+                elif isinstance(value, bool):
+                    lines.append(f'{key} = {str(value).lower()}')
+                else:
+                    lines.append(f'{key} = {value}')
+            lines.append('')
+
+        with open(path, 'w') as f:
+            f.write('\n'.join(lines))
+
+    @property
+    def staging_dir(self):
+        return self.get('paths', 'staging_dir', 'novels_obsidian')
+
+    @property
+    def obsidian_vault(self):
+        return self.get('paths', 'obsidian_vault', '')
+
+    @property
+    def database_path(self):
+        return self.get('paths', 'database', 'novels.db')
+
+    @property
+    def delay(self):
+        return self.get('scraper', 'delay', 1.5)
+
+    @property
+    def max_workers(self):
+        return self.get('scraper', 'max_workers', 4)
+
+    @property
+    def max_retries(self):
+        return self.get('scraper', 'max_retries', 3)
+
+
+# =============================================================================
+# Database
+# =============================================================================
+
+class Database:
+    """DuckDB database manager for tracking novels and chapters"""
+
+    SCHEMA = """
+    CREATE TABLE IF NOT EXISTS novels (
+        id INTEGER PRIMARY KEY,
+        name VARCHAR NOT NULL,
+        slug VARCHAR NOT NULL,
+        url VARCHAR NOT NULL,
+        site VARCHAR NOT NULL,
+        status VARCHAR DEFAULT 'ongoing',
+        total_chapters INTEGER,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        last_checked_at TIMESTAMP,
+        completed_at TIMESTAMP,
+        UNIQUE(slug, site)
+    );
+
+    CREATE TABLE IF NOT EXISTS chapters (
+        id INTEGER PRIMARY KEY,
+        novel_id INTEGER REFERENCES novels(id),
+        chapter_num INTEGER NOT NULL,
+        title VARCHAR,
+        file_path VARCHAR,
+        char_count INTEGER,
+        downloaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        in_obsidian BOOLEAN DEFAULT FALSE,
+        moved_at TIMESTAMP,
+        UNIQUE(novel_id, chapter_num)
+    );
+
+    CREATE TABLE IF NOT EXISTS sync_logs (
+        id INTEGER PRIMARY KEY,
+        novel_id INTEGER REFERENCES novels(id),
+        checked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        latest_available INTEGER,
+        new_chapters_found INTEGER,
+        chapters_downloaded INTEGER,
+        novel_completed BOOLEAN DEFAULT FALSE,
+        status VARCHAR
+    );
+
+    CREATE SEQUENCE IF NOT EXISTS novels_id_seq;
+    CREATE SEQUENCE IF NOT EXISTS chapters_id_seq;
+    CREATE SEQUENCE IF NOT EXISTS sync_logs_id_seq;
+    """
+
+    def __init__(self, db_path):
+        self.db_path = db_path
+        self.conn = None
+
+    def connect(self):
+        """Connect to database and initialize schema"""
+        self.conn = duckdb.connect(self.db_path)
+        # Initialize schema
+        for statement in self.SCHEMA.split(';'):
+            statement = statement.strip()
+            if statement:
+                try:
+                    self.conn.execute(statement)
+                except Exception:
+                    pass  # Ignore errors for existing objects
+        return self
+
+    def close(self):
+        """Close database connection"""
+        if self.conn:
+            self.conn.close()
+            self.conn = None
+
+    def __enter__(self):
+        return self.connect()
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
+    # Novel operations
+    def add_novel(self, name, slug, url, site, status='ongoing'):
+        """Add a new novel to track"""
+        try:
+            self.conn.execute("""
+                INSERT INTO novels (id, name, slug, url, site, status)
+                VALUES (nextval('novels_id_seq'), ?, ?, ?, ?, ?)
+            """, [name, slug, url, site, status])
+            return self.conn.execute(
+                "SELECT id FROM novels WHERE slug = ? AND site = ?", [slug, site]
+            ).fetchone()[0]
+        except duckdb.ConstraintException:
+            # Already exists, return existing ID
+            result = self.conn.execute(
+                "SELECT id FROM novels WHERE slug = ? AND site = ?", [slug, site]
+            ).fetchone()
+            return result[0] if result else None
+
+    def get_novel(self, novel_id=None, name=None, slug=None, site=None):
+        """Get a novel by ID, name, or slug+site"""
+        if novel_id:
+            result = self.conn.execute(
+                "SELECT * FROM novels WHERE id = ?", [novel_id]
+            ).fetchone()
+        elif name:
+            result = self.conn.execute(
+                "SELECT * FROM novels WHERE name = ?", [name]
+            ).fetchone()
+        elif slug and site:
+            result = self.conn.execute(
+                "SELECT * FROM novels WHERE slug = ? AND site = ?", [slug, site]
+            ).fetchone()
+        else:
+            return None
+
+        if result:
+            columns = ['id', 'name', 'slug', 'url', 'site', 'status',
+                       'total_chapters', 'created_at', 'last_checked_at', 'completed_at']
+            return dict(zip(columns, result))
+        return None
+
+    def list_novels(self):
+        """List all tracked novels with chapter counts"""
+        results = self.conn.execute("""
+            SELECT
+                n.id, n.name, n.slug, n.site, n.status, n.url,
+                COALESCE(MAX(c.chapter_num), 0) as latest_chapter,
+                COUNT(c.id) as chapter_count
+            FROM novels n
+            LEFT JOIN chapters c ON n.id = c.novel_id
+            GROUP BY n.id, n.name, n.slug, n.site, n.status, n.url
+            ORDER BY n.name
+        """).fetchall()
+
+        novels = []
+        for row in results:
+            novels.append({
+                'id': row[0],
+                'name': row[1],
+                'slug': row[2],
+                'site': row[3],
+                'status': row[4],
+                'url': row[5],
+                'latest_chapter': row[6],
+                'chapter_count': row[7],
+            })
+        return novels
+
+    def update_novel(self, novel_id, **kwargs):
+        """Update novel fields"""
+        valid_fields = ['name', 'status', 'total_chapters', 'last_checked_at', 'completed_at']
+        updates = []
+        values = []
+        for field, value in kwargs.items():
+            if field in valid_fields:
+                updates.append(f"{field} = ?")
+                values.append(value)
+
+        if updates:
+            values.append(novel_id)
+            self.conn.execute(
+                f"UPDATE novels SET {', '.join(updates)} WHERE id = ?",
+                values
+            )
+
+    def remove_novel(self, novel_id):
+        """Remove a novel and its chapters"""
+        self.conn.execute("DELETE FROM chapters WHERE novel_id = ?", [novel_id])
+        self.conn.execute("DELETE FROM sync_logs WHERE novel_id = ?", [novel_id])
+        self.conn.execute("DELETE FROM novels WHERE id = ?", [novel_id])
+
+    # Chapter operations
+    def add_chapter(self, novel_id, chapter_num, title=None, file_path=None, char_count=None):
+        """Add a chapter record"""
+        try:
+            self.conn.execute("""
+                INSERT INTO chapters (id, novel_id, chapter_num, title, file_path, char_count)
+                VALUES (nextval('chapters_id_seq'), ?, ?, ?, ?, ?)
+            """, [novel_id, chapter_num, title, file_path, char_count])
+            return True
+        except duckdb.ConstraintException:
+            # Already exists, update instead
+            self.conn.execute("""
+                UPDATE chapters
+                SET title = COALESCE(?, title),
+                    file_path = COALESCE(?, file_path),
+                    char_count = COALESCE(?, char_count)
+                WHERE novel_id = ? AND chapter_num = ?
+            """, [title, file_path, char_count, novel_id, chapter_num])
+            return False
+
+    def get_latest_chapter(self, novel_id):
+        """Get the latest downloaded chapter number"""
+        result = self.conn.execute(
+            "SELECT MAX(chapter_num) FROM chapters WHERE novel_id = ?", [novel_id]
+        ).fetchone()
+        return result[0] if result and result[0] else 0
+
+    def get_chapters(self, novel_id, in_obsidian=None):
+        """Get chapters for a novel"""
+        query = "SELECT chapter_num, title, file_path, in_obsidian FROM chapters WHERE novel_id = ?"
+        params = [novel_id]
+
+        if in_obsidian is not None:
+            query += " AND in_obsidian = ?"
+            params.append(in_obsidian)
+
+        query += " ORDER BY chapter_num"
+
+        results = self.conn.execute(query, params).fetchall()
+        return [{'chapter_num': r[0], 'title': r[1], 'file_path': r[2], 'in_obsidian': r[3]}
+                for r in results]
+
+    def mark_chapters_moved(self, novel_id, chapter_nums):
+        """Mark chapters as moved to Obsidian"""
+        if not chapter_nums:
+            return
+        placeholders = ','.join(['?'] * len(chapter_nums))
+        self.conn.execute(f"""
+            UPDATE chapters
+            SET in_obsidian = TRUE, moved_at = CURRENT_TIMESTAMP
+            WHERE novel_id = ? AND chapter_num IN ({placeholders})
+        """, [novel_id] + list(chapter_nums))
+
+    # Sync log operations
+    def add_sync_log(self, novel_id, latest_available, new_found, downloaded, status, completed=False):
+        """Add a sync log entry"""
+        self.conn.execute("""
+            INSERT INTO sync_logs (id, novel_id, latest_available, new_chapters_found,
+                                   chapters_downloaded, status, novel_completed)
+            VALUES (nextval('sync_logs_id_seq'), ?, ?, ?, ?, ?, ?)
+        """, [novel_id, latest_available, new_found, downloaded, status, completed])
+
+
+# =============================================================================
+# Base Scraper
+# =============================================================================
 
 class NovelScraper:
-    def __init__(self, output_dir="novels"):
-        self.output_dir = output_dir
+    """Base scraper class with common functionality"""
+
+    def __init__(self, config: Config):
+        self.config = config
+        self.output_dir = config.staging_dir
         self.scraper = cloudscraper.create_scraper(
             browser={
                 'browser': 'chrome',
@@ -37,7 +434,7 @@ class NovelScraper:
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
             'Accept-Language': 'en-US,en;q=0.5',
         })
-        self.chapters_saved = []
+        self.lock = threading.Lock()
 
     def sanitize_filename(self, name):
         """Convert name to valid filename"""
@@ -80,7 +477,6 @@ class NovelScraper:
 
         tag_slug = self.to_kebab_case(novel_name)
 
-        # Obsidian format with YAML frontmatter
         markdown_content = f"""---
 tags:
   - book/novel
@@ -101,10 +497,9 @@ tags:
         with open(filepath, 'w', encoding='utf-8') as f:
             f.write(markdown_content)
 
-        self.chapters_saved.append(chapter_num)
-        return filepath
+        return filepath, len(content)
 
-    def create_index_file(self, novel_name, total_chapters=None):
+    def create_index_file(self, novel_name, chapter_nums):
         """Create index file with links to all chapters"""
         folder_name = self.get_folder_name(novel_name)
         novel_dir = os.path.join(self.output_dir, folder_name)
@@ -116,25 +511,12 @@ tags:
         index_filename = f"{folder_name.replace(' ', '_')}_Index.md"
         index_filepath = os.path.join(novel_dir, index_filename)
 
-        # Get list of chapter numbers from saved chapters or scan directory
-        if self.chapters_saved:
-            chapter_nums = sorted(self.chapters_saved)
-        else:
-            chapter_nums = []
-            for f in os.listdir(novel_dir):
-                if f.endswith('.md') and f[0].isdigit():
-                    try:
-                        num = int(f.split(' - ')[0])
-                        chapter_nums.append(num)
-                    except (ValueError, IndexError):
-                        continue
-            chapter_nums.sort()
+        chapter_nums = sorted(chapter_nums)
 
-        # Build Table of Contents
         toc_lines = []
         for num in chapter_nums:
             wikilink = self.get_wikilink_name(novel_name, num)
-            toc_lines.append(f"- [Chapter {num}](#chapter-{num}) -> [[{wikilink}]]")
+            toc_lines.append(f"- [[{wikilink}|Chapter {num}]]")
 
         toc_content = '\n'.join(toc_lines)
 
@@ -147,7 +529,6 @@ tags:
 # {folder_name}
 
 ## Table of Contents
----
 
 {toc_content}
 """
@@ -155,20 +536,236 @@ tags:
         with open(index_filepath, 'w', encoding='utf-8') as f:
             f.write(index_content)
 
-        print(f"Created index file: {index_filename}")
         return index_filepath
+
+    # Methods to override in subclasses
+    def get_chapter_list(self, novel_slug):
+        """Fetch chapter list from website. Returns list of dicts with 'num', 'url', 'title'"""
+        raise NotImplementedError
+
+    def scrape_chapter_by_url(self, url, retries=3):
+        """Scrape a single chapter. Returns (title, content) or (None, None)"""
+        raise NotImplementedError
+
+    def get_novel_status(self, novel_slug):
+        """Check if novel is completed. Returns 'ongoing', 'completed', or 'hiatus'"""
+        return 'ongoing'
+
+    def get_latest_chapter_num(self, novel_slug):
+        """Get the latest available chapter number from website"""
+        chapters = self.get_chapter_list(novel_slug)
+        if chapters:
+            return max(c['num'] for c in chapters)
+        return 0
+
+
+# =============================================================================
+# Site-Specific Scrapers
+# =============================================================================
+
+class LightNovelTranslationsScraper(NovelScraper):
+    """Scraper for lightnovelstranslations.com"""
+
+    SITE = 'lightnovelstranslations.com'
+    BASE_URL = 'https://lightnovelstranslations.com'
+
+    def get_chapter_list(self, novel_slug):
+        """Fetch all chapter URLs from the table of contents page"""
+        toc_url = f"{self.BASE_URL}/novel/{novel_slug}/?tab=table_contents"
+
+        try:
+            response = self.scraper.get(toc_url, timeout=30)
+            if response.status_code == 200:
+                soup = BeautifulSoup(response.content, 'html.parser')
+
+                chapters = []
+                links = soup.find_all('a', href=True)
+
+                for link in links:
+                    href = link.get('href', '')
+                    if f'/novel/{novel_slug}/' in href and 'tab=' not in href:
+                        text = link.get_text(strip=True)
+                        if not text:
+                            continue
+
+                        chapter_num = None
+                        match = re.search(r'Chapter\s*(\d+)', text, re.IGNORECASE)
+                        if match:
+                            chapter_num = int(match.group(1))
+                        else:
+                            url_match = re.search(r'chapter-?(\d+)', href, re.IGNORECASE)
+                            if url_match:
+                                chapter_num = int(url_match.group(1))
+
+                        if chapter_num is not None:
+                            chapters.append({
+                                'num': chapter_num,
+                                'url': href,
+                                'title': link.get('title', text) or text
+                            })
+
+                # Remove duplicates
+                seen = set()
+                unique = []
+                for ch in chapters:
+                    if ch['num'] not in seen:
+                        seen.add(ch['num'])
+                        unique.append(ch)
+
+                unique.sort(key=lambda x: x['num'])
+                return unique
+        except Exception as e:
+            print(f"Error fetching chapter list: {e}")
+
+        return []
+
+    def scrape_chapter_by_url(self, url, retries=None):
+        """Scrape a single chapter by URL"""
+        retries = retries or self.config.max_retries
+
+        for attempt in range(retries):
+            try:
+                response = self.scraper.get(url, timeout=30)
+
+                if response.status_code == 200:
+                    soup = BeautifulSoup(response.content, 'html.parser')
+
+                    # Get title
+                    title = "Chapter"
+                    for selector in ["h2", "h1.entry-title", ".entry-title", "h1"]:
+                        elem = soup.select_one(selector)
+                        if elem and elem.get_text(strip=True):
+                            title = elem.get_text(strip=True)
+                            break
+
+                    # Get content
+                    content = ""
+                    for selector in [".entry-content", ".post-content", ".chapter-content", "article"]:
+                        elem = soup.select_one(selector)
+                        if elem:
+                            paragraphs = elem.find_all('p')
+                            if paragraphs:
+                                parts = []
+                                for p in paragraphs:
+                                    text = p.get_text(strip=True)
+                                    if len(text) > 15:
+                                        skip = ['prev chapter', 'next chapter', 'translator:',
+                                                'editor:', 'patreon', 'kofi', 'adsbygoogle',
+                                                'bookmark', 'comment', 'report', 'login']
+                                        if not any(s in text.lower() for s in skip):
+                                            parts.append(text)
+                                if parts:
+                                    content = '\n\n'.join(parts)
+                                    break
+
+                    if content and len(content) > 50:
+                        return title, content
+
+                elif response.status_code == 404:
+                    return None, None
+
+            except Exception as e:
+                if attempt < retries - 1:
+                    time.sleep(2)
+
+        return None, None
+
+    def get_novel_status(self, novel_slug):
+        """Check novel status from the page"""
+        url = f"{self.BASE_URL}/novel/{novel_slug}/"
+        try:
+            response = self.scraper.get(url, timeout=30)
+            if response.status_code == 200:
+                soup = BeautifulSoup(response.content, 'html.parser')
+                text = soup.get_text().lower()
+                if 'completed' in text or 'complete' in text:
+                    return 'completed'
+                if 'hiatus' in text:
+                    return 'hiatus'
+        except Exception:
+            pass
+        return 'ongoing'
+
+
+class FreeWebNovelScraper(NovelScraper):
+    """Scraper for freewebnovel.com"""
+
+    SITE = 'freewebnovel.com'
+    BASE_URL = 'https://freewebnovel.com'
+
+    def get_chapter_list(self, novel_slug):
+        """Generate chapter list (sequential URLs)"""
+        # FreeWebNovel uses sequential chapters, we need to find the max
+        # Try to get from the novel page
+        url = f"{self.BASE_URL}/{novel_slug}.html"
+        try:
+            response = self.scraper.get(url, timeout=30)
+            if response.status_code == 200:
+                soup = BeautifulSoup(response.content, 'html.parser')
+                links = soup.find_all('a', href=True)
+                max_chapter = 0
+                for link in links:
+                    href = link.get('href', '')
+                    match = re.search(r'chapter-(\d+)', href)
+                    if match:
+                        max_chapter = max(max_chapter, int(match.group(1)))
+
+                if max_chapter > 0:
+                    return [{'num': i, 'url': f"{self.BASE_URL}/{novel_slug}/chapter-{i}.html",
+                             'title': f"Chapter {i}"} for i in range(1, max_chapter + 1)]
+        except Exception:
+            pass
+        return []
+
+    def scrape_chapter_by_url(self, url, retries=None):
+        """Scrape a single chapter"""
+        retries = retries or self.config.max_retries
+
+        for attempt in range(retries):
+            try:
+                response = self.scraper.get(url, timeout=30)
+
+                if response.status_code == 200:
+                    soup = BeautifulSoup(response.content, 'html.parser')
+
+                    title = "Chapter"
+                    elem = soup.select_one('h1.tit, .chapter-title, h1')
+                    if elem:
+                        title = elem.get_text(strip=True)
+
+                    parts = []
+                    for p in soup.find_all('p'):
+                        text = p.get_text(strip=True)
+                        if len(text) > 15:
+                            skip = ['prev chapter', 'next chapter', 'freewebnovel.com',
+                                    'report chapter', 'tap the screen', 'log in']
+                            if not any(s in text.lower() for s in skip):
+                                parts.append(text)
+
+                    if parts:
+                        content = '\n\n'.join(parts)
+                        if len(content) > 100:
+                            return title, content
+
+                elif response.status_code == 404:
+                    return None, None
+
+            except Exception:
+                if attempt < retries - 1:
+                    time.sleep(2)
+
+        return None, None
 
 
 class NovelBinScraper(NovelScraper):
-    """Scraper for novelbin.me / novelbin.com"""
+    """Scraper for novelbin.com"""
 
-    def __init__(self, output_dir="novels"):
-        super().__init__(output_dir)
-        self.base_url = "https://novelbin.com"
+    SITE = 'novelbin.com'
+    BASE_URL = 'https://novelbin.com'
 
     def get_chapter_list(self, novel_slug):
-        """Fetch all chapter URLs from AJAX endpoint"""
-        ajax_url = f"{self.base_url}/ajax/chapter-archive?novelId={novel_slug}"
+        """Fetch chapter list from AJAX endpoint"""
+        ajax_url = f"{self.BASE_URL}/ajax/chapter-archive?novelId={novel_slug}"
 
         try:
             response = self.scraper.get(ajax_url, timeout=30)
@@ -180,232 +777,23 @@ class NovelBinScraper(NovelScraper):
                 for link in links:
                     href = link.get('href', '')
                     text = link.get_text(strip=True)
-
-                    # Extract chapter number from text
                     match = re.search(r'Chapter\s+(\d+)', text, re.IGNORECASE)
                     if match:
-                        chapter_num = int(match.group(1))
-                        chapters.append((chapter_num, href, text))
+                        chapters.append({
+                            'num': int(match.group(1)),
+                            'url': href,
+                            'title': text
+                        })
 
-                # Sort by chapter number
-                chapters.sort(key=lambda x: x[0])
+                chapters.sort(key=lambda x: x['num'])
                 return chapters
-        except Exception as e:
-            print(f"Error fetching chapter list: {e}")
-
+        except Exception:
+            pass
         return []
 
-    def get_chapter_url(self, novel_slug, chapter_num):
-        """Generate simple chapter URL (fallback)"""
-        return f"{self.base_url}/b/{novel_slug}/chapter-{chapter_num}"
-
-    def scrape_chapter_by_url(self, url, retries=3):
-        """Scrape a single chapter by full URL"""
-        for attempt in range(retries):
-            try:
-                response = self.scraper.get(url, timeout=30)
-
-                if response.status_code == 200:
-                    soup = BeautifulSoup(response.content, 'html.parser')
-
-                    # Get title
-                    title = "Chapter"
-                    title_selectors = [
-                        ".chr-title",
-                        "h2 a.chr-title",
-                        ".chapter-title",
-                        "h2.title",
-                        "h1",
-                    ]
-                    for selector in title_selectors:
-                        title_elem = soup.select_one(selector)
-                        if title_elem and title_elem.get_text(strip=True):
-                            title = title_elem.get_text(strip=True)
-                            break
-
-                    # Get content
-                    content_selectors = [
-                        "#chr-content",
-                        ".chr-c",
-                        "#chapter-content",
-                        ".chapter-content",
-                        ".reading-content",
-                    ]
-
-                    content = ""
-                    for selector in content_selectors:
-                        content_elem = soup.select_one(selector)
-                        if content_elem:
-                            paragraphs = content_elem.find_all('p')
-                            if paragraphs:
-                                content_parts = []
-                                for p in paragraphs:
-                                    text = p.get_text(strip=True)
-                                    if len(text) > 15:
-                                        skip_phrases = ['prev', 'next', 'comment', 'report', 'login', 'novelbin', 'bookmark']
-                                        if not any(skip in text.lower()[:50] for skip in skip_phrases):
-                                            content_parts.append(text)
-                                if content_parts:
-                                    content = '\n\n'.join(content_parts)
-                                    break
-
-                    # Fallback
-                    if not content or len(content) < 100:
-                        paragraphs = soup.find_all('p')
-                        content_parts = []
-                        for p in paragraphs:
-                            text = p.get_text(strip=True)
-                            if len(text) > 30:
-                                skip_phrases = ['prev', 'next', 'comment', 'report', 'login', 'novelbin', 'bookmark', 'chapter list']
-                                if not any(skip in text.lower()[:50] for skip in skip_phrases):
-                                    content_parts.append(text)
-                        if content_parts:
-                            content = '\n\n'.join(content_parts)
-
-                    if content and len(content) > 50:
-                        return title, content
-                    else:
-                        if attempt < retries - 1:
-                            print(f"  (attempt {attempt+1}) Low content: {len(content) if content else 0} chars")
-                elif response.status_code == 404:
-                    return None, None
-                else:
-                    print(f"  (attempt {attempt+1}) HTTP {response.status_code}")
-
-            except Exception as e:
-                print(f"  (attempt {attempt+1}) Error: {str(e)[:50]}")
-
-            if attempt < retries - 1:
-                time.sleep(3)
-
-        return None, None
-
-    def scrape_chapter(self, novel_slug, chapter_num, retries=3):
-        """Scrape a single chapter using simple URL"""
-        url = self.get_chapter_url(novel_slug, chapter_num)
-        return self.scrape_chapter_by_url(url, retries)
-
-    def scrape_with_chapter_list(self, novel_slug, novel_name, start_chapter=1, end_chapter=None, delay=2):
-        """Scrape using chapter list (for title-based URLs)"""
-        folder_name = self.get_folder_name(novel_name)
-
-        print(f"\n{'='*60}")
-        print(f"Fetching chapter list for: {folder_name}")
-        print(f"{'='*60}")
-
-        chapters = self.get_chapter_list(novel_slug)
-
-        if not chapters:
-            print("Failed to fetch chapter list!")
-            return 0, 0
-
-        print(f"Found {len(chapters)} chapters")
-
-        # Filter by range
-        if end_chapter:
-            chapters = [(num, url, title) for num, url, title in chapters if start_chapter <= num <= end_chapter]
-        else:
-            chapters = [(num, url, title) for num, url, title in chapters if num >= start_chapter]
-
-        print(f"Scraping {len(chapters)} chapters ({start_chapter} to {chapters[-1][0] if chapters else 'N/A'})")
-        print(f"{'='*60}\n")
-
-        self.chapters_saved = []
-        successful = 0
-        failed = 0
-        failed_chapters = []
-
-        total = len(chapters)
-        for i, (chapter_num, url, chapter_title) in enumerate(chapters):
-            print(f"[{i+1}/{total}] Chapter {chapter_num}...", end=" ", flush=True)
-
-            title, content = self.scrape_chapter_by_url(url)
-
-            if content:
-                filepath = self.save_chapter(novel_name, chapter_num, title, content)
-                print(f"OK ({len(content)} chars)")
-                successful += 1
-            else:
-                print("FAILED")
-                failed += 1
-                failed_chapters.append(chapter_num)
-
-            if i < total - 1:
-                time.sleep(delay)
-
-        # Create index file
-        if successful > 0:
-            self.create_index_file(novel_name)
-
-        print(f"\n{'='*60}")
-        print(f"Complete: {successful} successful, {failed} failed")
-        print(f"Output folder: {folder_name}")
-        if failed_chapters:
-            print(f"Failed chapters: {failed_chapters[:20]}{'...' if len(failed_chapters) > 20 else ''}")
-        print(f"{'='*60}")
-
-        return successful, failed
-
-    def scrape_range(self, novel_slug, novel_name, start_chapter, end_chapter, delay=2):
-        """Scrape a range of chapters (simple URL format)"""
-        folder_name = self.get_folder_name(novel_name)
-
-        print(f"\n{'='*60}")
-        print(f"Scraping: {folder_name}")
-        print(f"Source: novelbin.com")
-        print(f"Chapters: {start_chapter} to {end_chapter}")
-        print(f"{'='*60}\n")
-
-        self.chapters_saved = []
-        successful = 0
-        failed = 0
-        failed_chapters = []
-
-        for chapter_num in range(start_chapter, end_chapter + 1):
-            print(f"[{chapter_num}/{end_chapter}] Scraping chapter {chapter_num}...", end=" ", flush=True)
-
-            title, content = self.scrape_chapter(novel_slug, chapter_num)
-
-            if content:
-                filepath = self.save_chapter(novel_name, chapter_num, title, content)
-                print(f"OK ({len(content)} chars)")
-                successful += 1
-            else:
-                print("FAILED")
-                failed += 1
-                failed_chapters.append(chapter_num)
-
-            if chapter_num < end_chapter:
-                time.sleep(delay)
-
-        # Create index file
-        if successful > 0:
-            self.create_index_file(novel_name)
-
-        print(f"\n{'='*60}")
-        print(f"Complete: {successful} successful, {failed} failed")
-        print(f"Output folder: {folder_name}")
-        if failed_chapters:
-            print(f"Failed chapters: {failed_chapters[:20]}{'...' if len(failed_chapters) > 20 else ''}")
-        print(f"{'='*60}")
-
-        return successful, failed
-
-
-class FreeWebNovelScraper(NovelScraper):
-    """Scraper for freewebnovel.com - no Cloudflare issues"""
-
-    def __init__(self, output_dir="novels"):
-        super().__init__(output_dir)
-        self.base_url = "https://freewebnovel.com"
-
-    def get_chapter_url(self, novel_slug, chapter_num):
-        """Generate chapter URL"""
-        return f"{self.base_url}/novel/{novel_slug}/chapter-{chapter_num}"
-
-    def scrape_chapter(self, novel_slug, chapter_num, retries=3):
+    def scrape_chapter_by_url(self, url, retries=None):
         """Scrape a single chapter"""
-        url = self.get_chapter_url(novel_slug, chapter_num)
+        retries = retries or self.config.max_retries
 
         for attempt in range(retries):
             try:
@@ -414,889 +802,694 @@ class FreeWebNovelScraper(NovelScraper):
                 if response.status_code == 200:
                     soup = BeautifulSoup(response.content, 'html.parser')
 
-                    # Get title
-                    title = f"Chapter {chapter_num}"
-                    title_elem = soup.select_one('h1.tit, .chapter-title, h1')
-                    if title_elem:
-                        title = title_elem.get_text(strip=True)
-
-                    # Get content - freewebnovel uses paragraphs directly
-                    content_parts = []
-                    paragraphs = soup.find_all('p')
-
-                    for p in paragraphs:
-                        text = p.get_text(strip=True)
-                        if len(text) > 15:
-                            skip_phrases = [
-                                'prev chapter', 'next chapter', 'use arrow keys',
-                                'report chapter', 'freewebnovel.com', 'contact',
-                                'sitemap', 'privacy policy', 'log in', 'create account',
-                                'tap the screen', 'add to library', 'submit', 'comments',
-                                'welcome to freewebnovel', "don't have an account"
-                            ]
-                            if not any(skip in text.lower() for skip in skip_phrases):
-                                content_parts.append(text)
-
-                    if content_parts:
-                        content = '\n\n'.join(content_parts)
-                        if len(content) > 100:
-                            return title, content
-
-                elif response.status_code == 404:
-                    return None, None
-
-            except Exception as e:
-                if attempt < retries - 1:
-                    print(f"  (attempt {attempt+1}) Error: {str(e)[:50]}")
-
-            if attempt < retries - 1:
-                time.sleep(2)
-
-        return None, None
-
-    def scrape_range(self, novel_slug, novel_name, start_chapter, end_chapter, delay=1.5):
-        """Scrape a range of chapters"""
-        folder_name = self.get_folder_name(novel_name)
-
-        print(f"\n{'='*60}")
-        print(f"Scraping: {folder_name}")
-        print(f"Source: freewebnovel.com")
-        print(f"Chapters: {start_chapter} to {end_chapter}")
-        print(f"{'='*60}\n")
-
-        self.chapters_saved = []
-        successful = 0
-        failed = 0
-        failed_chapters = []
-
-        for chapter_num in range(start_chapter, end_chapter + 1):
-            print(f"[{chapter_num}/{end_chapter}] Chapter {chapter_num}...", end=" ", flush=True)
-
-            title, content = self.scrape_chapter(novel_slug, chapter_num)
-
-            if content:
-                self.save_chapter(novel_name, chapter_num, title, content)
-                print(f"OK ({len(content)} chars)")
-                successful += 1
-            else:
-                print("FAILED")
-                failed += 1
-                failed_chapters.append(chapter_num)
-
-            if chapter_num < end_chapter:
-                time.sleep(delay)
-
-        # Create index file
-        if successful > 0:
-            self.create_index_file(novel_name)
-
-        print(f"\n{'='*60}")
-        print(f"Complete: {successful} successful, {failed} failed")
-        print(f"Output folder: {folder_name}")
-        if failed_chapters:
-            print(f"Failed chapters: {failed_chapters[:20]}{'...' if len(failed_chapters) > 20 else ''}")
-        print(f"{'='*60}")
-
-        return successful, failed
-
-
-class LightNovelTranslationsScraper(NovelScraper):
-    """Scraper for lightnovelstranslations.com"""
-
-    def __init__(self, output_dir="novels"):
-        super().__init__(output_dir)
-        self.base_url = "https://lightnovelstranslations.com"
-
-    def get_chapter_list(self, novel_slug):
-        """Fetch all chapter URLs from the table of contents page"""
-        toc_url = f"{self.base_url}/novel/{novel_slug}/?tab=table_contents"
-
-        try:
-            response = self.scraper.get(toc_url, timeout=30)
-            if response.status_code == 200:
-                soup = BeautifulSoup(response.content, 'html.parser')
-
-                # Find all chapter links
-                chapters = []
-                links = soup.find_all('a', href=True)
-
-                for link in links:
-                    href = link.get('href', '')
-                    # Match chapter URLs for this novel
-                    if f'/novel/{novel_slug}/' in href and href != toc_url:
-                        text = link.get_text(strip=True)
-                        title = link.get('title', text)
-
-                        # Skip navigation links and non-chapter links
-                        if not text or 'tab=' in href:
-                            continue
-
-                        # Extract chapter number from text or URL
-                        chapter_num = None
-
-                        # Try to find chapter number in text
-                        match = re.search(r'Chapter\s*(\d+)', text, re.IGNORECASE)
-                        if match:
-                            chapter_num = int(match.group(1))
-                        else:
-                            # Try URL pattern
-                            url_match = re.search(r'chapter-?(\d+)', href, re.IGNORECASE)
-                            if url_match:
-                                chapter_num = int(url_match.group(1))
-
-                        if chapter_num is not None:
-                            chapters.append({
-                                'num': chapter_num,
-                                'url': href,
-                                'title': title or text
-                            })
-
-                # Remove duplicates (keep first occurrence)
-                seen = set()
-                unique_chapters = []
-                for ch in chapters:
-                    if ch['num'] not in seen:
-                        seen.add(ch['num'])
-                        unique_chapters.append(ch)
-
-                # Sort by chapter number
-                unique_chapters.sort(key=lambda x: x['num'])
-                return unique_chapters
-
-        except Exception as e:
-            print(f"Error fetching chapter list: {e}")
-
-        return []
-
-    def scrape_chapter_by_url(self, url, retries=3):
-        """Scrape a single chapter by URL"""
-        for attempt in range(retries):
-            try:
-                response = self.scraper.get(url, timeout=30)
-
-                if response.status_code == 200:
-                    soup = BeautifulSoup(response.content, 'html.parser')
-
-                    # Get chapter title
                     title = "Chapter"
-                    title_selectors = [
-                        "h2",
-                        "h1.entry-title",
-                        ".entry-title",
-                        "h1",
-                        ".chapter-title"
-                    ]
-                    for selector in title_selectors:
-                        title_elem = soup.select_one(selector)
-                        if title_elem and title_elem.get_text(strip=True):
-                            title = title_elem.get_text(strip=True)
+                    for selector in [".chr-title", "h2 a.chr-title", "h1"]:
+                        elem = soup.select_one(selector)
+                        if elem and elem.get_text(strip=True):
+                            title = elem.get_text(strip=True)
                             break
 
-                    # Get content - try various selectors
-                    content_selectors = [
-                        ".entry-content",
-                        ".post-content",
-                        ".chapter-content",
-                        ".reading-content",
-                        "article .content",
-                        ".text-left",
-                        "article"
-                    ]
-
                     content = ""
-                    for selector in content_selectors:
-                        content_elem = soup.select_one(selector)
-                        if content_elem:
-                            paragraphs = content_elem.find_all('p')
-                            if paragraphs:
-                                content_parts = []
-                                for p in paragraphs:
-                                    text = p.get_text(strip=True)
-                                    if len(text) > 15:
-                                        # Skip navigation, ads, and meta content
-                                        skip_phrases = [
-                                            'prev chapter', 'next chapter', 'previous chapter',
-                                            'translator:', 'editor:', 'proofreader:',
-                                            'support us', 'patreon', 'kofi', 'ko-fi',
-                                            'adsbygoogle', 'advertisement', 'sponsored',
-                                            'bookmark', 'comment', 'report chapter',
-                                            'font size', 'background color', 'reading mode',
-                                            'previous_page', 'next_page', 'login', 'register',
-                                            'vip member', 'table of contents', 'chapter list'
-                                        ]
-                                        text_lower = text.lower()
-                                        if not any(skip in text_lower for skip in skip_phrases):
-                                            content_parts.append(text)
-
-                                if content_parts:
-                                    content = '\n\n'.join(content_parts)
-                                    break
-
-                    # Fallback: get all paragraphs from page
-                    if not content or len(content) < 100:
-                        paragraphs = soup.find_all('p')
-                        content_parts = []
-                        for p in paragraphs:
-                            text = p.get_text(strip=True)
-                            if len(text) > 30:
-                                skip_phrases = [
-                                    'prev chapter', 'next chapter', 'previous chapter',
-                                    'translator:', 'editor:', 'support us', 'patreon',
-                                    'adsbygoogle', 'bookmark', 'comment', 'report',
-                                    'font size', 'login', 'register', 'vip member',
-                                    'table of contents', 'chapter list', 'previous_page',
-                                    'next_page', 'reading mode', 'sponsored'
-                                ]
-                                text_lower = text.lower()
-                                if not any(skip in text_lower for skip in skip_phrases):
-                                    content_parts.append(text)
-
-                        if content_parts:
-                            content = '\n\n'.join(content_parts)
+                    for selector in ["#chr-content", ".chr-c", "#chapter-content"]:
+                        elem = soup.select_one(selector)
+                        if elem:
+                            parts = []
+                            for p in elem.find_all('p'):
+                                text = p.get_text(strip=True)
+                                if len(text) > 15:
+                                    skip = ['prev', 'next', 'comment', 'novelbin']
+                                    if not any(s in text.lower()[:50] for s in skip):
+                                        parts.append(text)
+                            if parts:
+                                content = '\n\n'.join(parts)
+                                break
 
                     if content and len(content) > 50:
                         return title, content
-                    else:
-                        if attempt < retries - 1:
-                            print(f"  (attempt {attempt+1}) Low content: {len(content) if content else 0} chars")
 
                 elif response.status_code == 404:
                     return None, None
-                else:
-                    print(f"  (attempt {attempt+1}) HTTP {response.status_code}")
 
-            except Exception as e:
+            except Exception:
                 if attempt < retries - 1:
-                    print(f"  (attempt {attempt+1}) Error: {str(e)[:50]}")
-
-            if attempt < retries - 1:
-                time.sleep(2)
+                    time.sleep(3)
 
         return None, None
 
-    def scrape_range(self, novel_slug, novel_name, start_chapter=1, end_chapter=None, delay=1.5):
-        """Scrape chapters using the chapter list"""
-        folder_name = self.get_folder_name(novel_name)
 
-        print(f"\n{'='*60}")
-        print(f"Fetching chapter list for: {folder_name}")
-        print(f"Source: lightnovelstranslations.com")
-        print(f"{'='*60}")
+# Scraper registry
+SCRAPERS = {
+    'lightnovelstranslations.com': LightNovelTranslationsScraper,
+    'freewebnovel.com': FreeWebNovelScraper,
+    'novelbin.com': NovelBinScraper,
+}
 
-        chapters = self.get_chapter_list(novel_slug)
 
-        if not chapters:
-            print("Failed to fetch chapter list!")
-            return 0, 0
+def get_scraper_for_url(url, config):
+    """Get the appropriate scraper for a URL"""
+    url_lower = url.lower()
+    for site, scraper_class in SCRAPERS.items():
+        if site in url_lower:
+            return scraper_class(config), site
+    return None, None
 
-        print(f"Found {len(chapters)} chapters")
 
-        # Filter by range
-        if end_chapter:
-            chapters = [c for c in chapters if start_chapter <= c['num'] <= end_chapter]
-        else:
-            chapters = [c for c in chapters if c['num'] >= start_chapter]
+def extract_slug_from_url(url, site):
+    """Extract novel slug from URL"""
+    if 'lightnovelstranslations.com' in site:
+        match = re.search(r'/novel/([^/?]+)', url)
+        return match.group(1) if match else None
+    elif 'freewebnovel.com' in site:
+        slug = url.rstrip('/').split('/')[-1].replace('.html', '')
+        if slug.startswith('chapter-'):
+            slug = url.rstrip('/').split('/')[-2]
+        return slug
+    elif 'novelbin.com' in site:
+        match = re.search(r'/b/([^/]+)', url)
+        return match.group(1) if match else None
+    return None
 
-        if not chapters:
-            print("No chapters found in the specified range!")
-            return 0, 0
 
-        print(f"Scraping {len(chapters)} chapters ({chapters[0]['num']} to {chapters[-1]['num']})")
-        print(f"{'='*60}\n")
+# =============================================================================
+# Novel Manager (Orchestrates everything)
+# =============================================================================
 
-        self.chapters_saved = []
-        successful = 0
-        failed = 0
-        failed_chapters = []
+class NovelManager:
+    """Main manager for novel scraping operations"""
 
-        total = len(chapters)
-        for i, chapter in enumerate(chapters):
-            chapter_num = chapter['num']
-            url = chapter['url']
-            print(f"[{i+1}/{total}] Chapter {chapter_num}...", end=" ", flush=True)
+    def __init__(self, config: Config = None):
+        self.config = config or Config()
+        self.config.load()
+        self.db = Database(self.config.database_path)
 
-            title, content = self.scrape_chapter_by_url(url)
+    def add_novel(self, url, name):
+        """Add a new novel to track"""
+        scraper, site = get_scraper_for_url(url, self.config)
+        if not scraper:
+            print(f"Error: Unsupported site for URL: {url}")
+            return None
 
-            if content:
-                self.save_chapter(novel_name, chapter_num, title, content)
-                print(f"OK ({len(content)} chars)")
-                successful += 1
+        slug = extract_slug_from_url(url, site)
+        if not slug:
+            print(f"Error: Could not extract novel slug from URL")
+            return None
+
+        with self.db:
+            novel_id = self.db.add_novel(name, slug, url, site)
+            print(f"Added novel: {name} (ID: {novel_id})")
+            return novel_id
+
+    def list_novels(self, json_output=False):
+        """List all tracked novels"""
+        with self.db:
+            novels = self.db.list_novels()
+
+        if json_output:
+            print(json.dumps(novels, indent=2, default=str))
+            return novels
+
+        if not novels:
+            print("No novels being tracked. Use 'add' to add a novel.")
+            return []
+
+        print(f"\n{'ID':<4} {'Name':<35} {'Status':<10} {'Chapters':<10} {'Site'}")
+        print("-" * 80)
+        for n in novels:
+            print(f"{n['id']:<4} {n['name'][:34]:<35} {n['status']:<10} {n['latest_chapter']:<10} {n['site']}")
+        print()
+        return novels
+
+    def remove_novel(self, name):
+        """Remove a novel from tracking"""
+        with self.db:
+            novel = self.db.get_novel(name=name)
+            if not novel:
+                print(f"Error: Novel '{name}' not found")
+                return False
+
+            self.db.remove_novel(novel['id'])
+            print(f"Removed novel: {name}")
+            return True
+
+    def check_novels(self, name=None, json_output=False):
+        """Check for new chapters"""
+        with self.db:
+            if name:
+                novel = self.db.get_novel(name=name)
+                if not novel:
+                    print(f"Error: Novel '{name}' not found")
+                    return []
+                novels = [novel]
             else:
-                print("FAILED")
-                failed += 1
-                failed_chapters.append(chapter_num)
+                novels = self.db.list_novels()
 
-            if i < total - 1:
-                time.sleep(delay)
+        results = []
+        for novel in novels:
+            scraper, _ = get_scraper_for_url(novel['url'], self.config)
+            if not scraper:
+                continue
 
-        # Create index file
-        if successful > 0:
-            self.create_index_file(novel_name)
+            print(f"Checking: {novel['name']}...", end=" ", flush=True)
 
-        print(f"\n{'='*60}")
-        print(f"Complete: {successful} successful, {failed} failed")
-        print(f"Output folder: {folder_name}")
-        if failed_chapters:
-            print(f"Failed chapters: {failed_chapters[:20]}{'...' if len(failed_chapters) > 20 else ''}")
-        print(f"{'='*60}")
+            chapters = scraper.get_chapter_list(novel['slug'])
+            latest_available = max(c['num'] for c in chapters) if chapters else 0
 
-        return successful, failed
+            with self.db:
+                latest_local = self.db.get_latest_chapter(novel['id'])
 
+            new_count = max(0, latest_available - latest_local)
+            status = scraper.get_novel_status(novel['slug'])
 
-class WebNovelScraper(NovelScraper):
-    """Scraper for webnovel.com - uses API and cloudscraper"""
+            result = {
+                'name': novel['name'],
+                'local': latest_local,
+                'available': latest_available,
+                'new': new_count,
+                'status': status,
+            }
+            results.append(result)
 
-    def __init__(self, output_dir="novels", headless=True):
-        super().__init__(output_dir)
-        self.base_url = "https://www.webnovel.com"
-        self.mobile_url = "https://m.webnovel.com"
-        self.api_url = "https://www.webnovel.com/go/pcm/chapter"
-        self.headless = headless
-        self.use_selenium = False
-        self.driver = None
+            if new_count > 0:
+                print(f"{latest_local} local, {latest_available} available (+{new_count} new) [{status}]")
+            else:
+                print(f"up to date ({latest_local}) [{status}]")
 
-        # Update headers for webnovel.com
-        self.scraper.headers.update({
-            'Accept': 'application/json, text/plain, */*',
-            'Referer': 'https://www.webnovel.com/',
-            'Origin': 'https://www.webnovel.com',
-        })
+            # Update last checked
+            with self.db:
+                self.db.update_novel(novel['id'], last_checked_at=datetime.now(), status=status)
+                if status == 'completed':
+                    self.db.update_novel(novel['id'], completed_at=datetime.now(),
+                                         total_chapters=latest_available)
 
-    def _init_driver(self):
-        """Initialize Selenium WebDriver (fallback)"""
-        if self.driver is not None:
+        if json_output:
+            print(json.dumps(results, indent=2))
+
+        return results
+
+    def sync_novel(self, name=None, all_novels=False, parallel=True):
+        """Download new chapters"""
+        with self.db:
+            if all_novels:
+                novels = self.db.list_novels()
+            elif name:
+                novel = self.db.get_novel(name=name)
+                if not novel:
+                    print(f"Error: Novel '{name}' not found")
+                    return
+                novels = [novel]
+            else:
+                print("Error: Specify --name or --all")
+                return
+
+        for novel in novels:
+            self._sync_single_novel(novel, parallel)
+
+    def _sync_single_novel(self, novel, parallel=True):
+        """Sync a single novel"""
+        scraper, _ = get_scraper_for_url(novel['url'], self.config)
+        if not scraper:
+            print(f"Error: No scraper for {novel['name']}")
             return
 
-        try:
-            chrome_options = Options()
-            if self.headless:
-                chrome_options.add_argument("--headless=new")
-            chrome_options.add_argument("--no-sandbox")
-            chrome_options.add_argument("--disable-dev-shm-usage")
-            chrome_options.add_argument("--disable-gpu")
-            chrome_options.add_argument("--window-size=1920,1080")
-            chrome_options.add_argument("--user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-            chrome_options.add_argument("--disable-blink-features=AutomationControlled")
-            chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
-            chrome_options.add_experimental_option('useAutomationExtension', False)
-
-            service = Service(ChromeDriverManager().install())
-            self.driver = webdriver.Chrome(service=service, options=chrome_options)
-            self.driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {
-                'source': 'Object.defineProperty(navigator, "webdriver", {get: () => undefined})'
-            })
-            self.use_selenium = True
-        except Exception as e:
-            print(f"Could not initialize Selenium: {e}")
-            print("Continuing with cloudscraper only...")
-            self.use_selenium = False
-
-    def _close_driver(self):
-        """Close the WebDriver"""
-        if self.driver:
-            self.driver.quit()
-            self.driver = None
-
-    def get_novel_info(self, book_id):
-        """Get novel title and chapter list from the book page"""
-        url = f"{self.base_url}/book/{book_id}"
-        print(f"Fetching novel info from: {url}")
-
-        try:
-            response = self.scraper.get(url, timeout=30)
-            if response.status_code == 200:
-                soup = BeautifulSoup(response.content, 'html.parser')
-
-                # Get novel title
-                title = "Unknown Novel"
-                title_selectors = [
-                    "h1.pt4.pb4.ell.dib",
-                    "h1",
-                    ".g_title",
-                    ".det-hd h1",
-                    "meta[property='og:title']"
-                ]
-                for selector in title_selectors:
-                    if selector.startswith('meta'):
-                        title_elem = soup.select_one(selector)
-                        if title_elem:
-                            title = title_elem.get('content', '')
-                            if title:
-                                break
-                    else:
-                        title_elem = soup.select_one(selector)
-                        if title_elem and title_elem.get_text(strip=True):
-                            title = title_elem.get_text(strip=True)
-                            break
-
-                # Try to get chapter list from various sources
-                chapters = []
-
-                # Method 1: Look for chapter links in page
-                chapter_selectors = [
-                    "a[href*='/book/'][href*='/']",
-                    ".volume-list a",
-                    ".catalog-wrap a",
-                    ".chapter-item a"
-                ]
-
-                for selector in chapter_selectors:
-                    links = soup.select(selector)
-                    for link in links:
-                        href = link.get('href', '')
-                        text = link.get_text(strip=True)
-                        if '/book/' in href and book_id in href:
-                            parts = href.rstrip('/').split('/')
-                            if len(parts) >= 2:
-                                chapter_id = parts[-1]
-                                if chapter_id.isdigit() and chapter_id != book_id:
-                                    match = re.search(r'Chapter\s*(\d+)', text, re.IGNORECASE)
-                                    chapter_num = int(match.group(1)) if match else len(chapters) + 1
-                                    chapters.append({
-                                        'num': chapter_num,
-                                        'id': chapter_id,
-                                        'title': text,
-                                        'url': f"{self.base_url}{href}" if href.startswith('/') else href
-                                    })
-
-                # Method 2: Try the API endpoint for chapter list
-                if not chapters:
-                    api_url = f"{self.base_url}/go/pcm/bookIndex/getBookIndexList"
-                    params = {
-                        '_csrfToken': '',
-                        'bookId': book_id,
-                    }
-                    try:
-                        api_response = self.scraper.get(api_url, params=params, timeout=30)
-                        if api_response.status_code == 200:
-                            data = api_response.json()
-                            if data.get('code') == 0 and 'data' in data:
-                                volumes = data['data'].get('volumeItems', [])
-                                for volume in volumes:
-                                    for chapter in volume.get('chapterItems', []):
-                                        chapters.append({
-                                            'num': chapter.get('index', len(chapters) + 1),
-                                            'id': str(chapter.get('id', '')),
-                                            'title': chapter.get('name', f"Chapter {len(chapters) + 1}"),
-                                            'url': f"{self.base_url}/book/{book_id}/{chapter.get('id', '')}"
-                                        })
-                    except Exception as e:
-                        print(f"API chapter list failed: {e}")
-
-                # Remove duplicates
-                seen = set()
-                unique_chapters = []
-                for ch in chapters:
-                    if ch['id'] not in seen:
-                        seen.add(ch['id'])
-                        unique_chapters.append(ch)
-
-                # Sort by chapter number
-                unique_chapters.sort(key=lambda x: x['num'])
-
-                return title, unique_chapters
-
-        except Exception as e:
-            print(f"Error fetching novel info: {e}")
-
-        return None, []
-
-    def get_chapter_url(self, book_id, chapter_id):
-        """Generate chapter URL"""
-        return f"{self.base_url}/book/{book_id}/{chapter_id}"
-
-    def scrape_chapter_by_url(self, url, retries=3):
-        """Scrape a single chapter by URL"""
-        for attempt in range(retries):
-            try:
-                response = self.scraper.get(url, timeout=30)
-
-                if response.status_code == 200:
-                    soup = BeautifulSoup(response.content, 'html.parser')
-
-                    # Get chapter title
-                    title = "Chapter"
-                    title_selectors = [
-                        ".cha-tit .dib.ell",
-                        ".cha-tit h1",
-                        ".chapter-title",
-                        ".cha-hd-txt",
-                        "h1.chapter-tit",
-                        ".tit",
-                        "h1"
-                    ]
-                    for selector in title_selectors:
-                        title_elem = soup.select_one(selector)
-                        if title_elem and title_elem.get_text(strip=True):
-                            title = title_elem.get_text(strip=True)
-                            break
-
-                    # Get content
-                    content_selectors = [
-                        ".cha-content .cha-words",
-                        ".chapter-content",
-                        ".cha-content",
-                        ".chapter_content",
-                        ".j_contentBox",
-                        ".content-container",
-                        ".cha-words",
-                        ".chapter-body"
-                    ]
-
-                    content = ""
-                    for selector in content_selectors:
-                        content_elem = soup.select_one(selector)
-                        if content_elem:
-                            # Get paragraphs
-                            paragraphs = content_elem.find_all('p')
-                            if paragraphs:
-                                content_parts = []
-                                for p in paragraphs:
-                                    text = p.get_text(strip=True)
-                                    if len(text) > 10:
-                                        skip_phrases = [
-                                            'translator', 'editor:', 'proofreader',
-                                            'support us', 'webnovel.com', 'unlock',
-                                            'subscribe', 'comment', 'vote', 'coin',
-                                            'prev chapter', 'next chapter', 'report',
-                                            'please use the app', 'support the creator',
-                                            'reading preference', 'font', 'webnovel'
-                                        ]
-                                        if not any(skip in text.lower()[:80] for skip in skip_phrases):
-                                            content_parts.append(text)
-                                if content_parts:
-                                    content = '\n\n'.join(content_parts)
-                                    break
-
-                            # Fallback: get direct text
-                            if not content:
-                                text = content_elem.get_text(separator='\n', strip=True)
-                                if len(text) > 100:
-                                    # Clean up the text
-                                    lines = [l.strip() for l in text.split('\n') if l.strip() and len(l.strip()) > 10]
-                                    content = '\n\n'.join(lines)
-
-                    if content and len(content) > 50:
-                        return title, content
-                    else:
-                        if attempt < retries - 1:
-                            print(f"  (attempt {attempt+1}) Low content: {len(content) if content else 0} chars")
-
-                elif response.status_code == 403:
-                    print(f"  (attempt {attempt+1}) Access denied (403)")
-                elif response.status_code == 404:
-                    return None, None
-                else:
-                    print(f"  (attempt {attempt+1}) HTTP {response.status_code}")
-
-            except Exception as e:
-                if attempt < retries - 1:
-                    print(f"  (attempt {attempt+1}) Error: {str(e)[:50]}")
-
-            if attempt < retries - 1:
-                time.sleep(3)
-
-        return None, None
-
-    def scrape_chapter_api(self, book_id, chapter_id, retries=3):
-        """Try to get chapter content via API"""
-        api_url = f"{self.base_url}/go/pcm/chapter/getContent"
-        params = {
-            '_csrfToken': '',
-            'bookId': book_id,
-            'chapterId': chapter_id,
-        }
-
-        for attempt in range(retries):
-            try:
-                response = self.scraper.get(api_url, params=params, timeout=30)
-                if response.status_code == 200:
-                    data = response.json()
-                    if data.get('code') == 0 and 'data' in data:
-                        chapter_data = data['data'].get('chapterInfo', {})
-                        title = chapter_data.get('chapterName', 'Chapter')
-                        content = chapter_data.get('content', '')
-
-                        if content:
-                            # Clean HTML from content
-                            soup = BeautifulSoup(content, 'html.parser')
-                            paragraphs = soup.find_all('p')
-                            if paragraphs:
-                                content = '\n\n'.join([p.get_text(strip=True) for p in paragraphs if p.get_text(strip=True)])
-                            else:
-                                content = soup.get_text(separator='\n\n', strip=True)
-
-                            if len(content) > 50:
-                                return title, content
-            except Exception as e:
-                if attempt < retries - 1:
-                    print(f"  API (attempt {attempt+1}) Error: {str(e)[:50]}")
-
-            if attempt < retries - 1:
-                time.sleep(2)
-
-        return None, None
-
-    def scrape_chapter(self, book_id, chapter_id, retries=3):
-        """Scrape a single chapter - tries API first, then URL"""
-        # Try API first
-        title, content = self.scrape_chapter_api(book_id, chapter_id, retries=1)
-        if content:
-            return title, content
-
-        # Fallback to URL scraping
-        url = self.get_chapter_url(book_id, chapter_id)
-        return self.scrape_chapter_by_url(url, retries)
-
-    def scrape_range(self, book_id, novel_name, start_chapter=1, end_chapter=None, delay=2):
-        """Scrape a range of chapters"""
-        folder_name = self.get_folder_name(novel_name)
-
         print(f"\n{'='*60}")
-        print(f"Scraping: {folder_name}")
-        print(f"Source: webnovel.com")
-        print(f"Book ID: {book_id}")
-        print(f"{'='*60}\n")
+        print(f"Syncing: {novel['name']}")
+        print(f"{'='*60}")
 
-        # First get chapter list
-        print("Fetching chapter list...")
-        title, chapters = self.get_novel_info(book_id)
-
-        if title and title != "Unknown Novel":
-            print(f"Novel title: {title}")
-
+        # Get chapter list
+        chapters = scraper.get_chapter_list(novel['slug'])
         if not chapters:
-            print("Could not fetch chapter list automatically.")
-            print("Trying sequential chapter IDs...")
-            return self._scrape_sequential(book_id, novel_name, start_chapter, end_chapter or 100, delay)
+            print("Failed to fetch chapter list")
+            return
 
-        print(f"Found {len(chapters)} chapters")
+        # Find new chapters
+        with self.db:
+            latest_local = self.db.get_latest_chapter(novel['id'])
 
-        # Filter by range
-        if end_chapter:
-            chapters = [c for c in chapters if start_chapter <= c['num'] <= end_chapter]
+        new_chapters = [c for c in chapters if c['num'] > latest_local]
+
+        if not new_chapters:
+            print("No new chapters")
+            return
+
+        print(f"Found {len(new_chapters)} new chapters ({new_chapters[0]['num']} to {new_chapters[-1]['num']})")
+
+        # Download
+        if parallel and len(new_chapters) > 1:
+            successful, failed = self._download_parallel(scraper, novel, new_chapters)
         else:
-            chapters = [c for c in chapters if c['num'] >= start_chapter]
+            successful, failed = self._download_sequential(scraper, novel, new_chapters)
+
+        # Create index
+        if successful > 0:
+            with self.db:
+                all_chapters = self.db.get_chapters(novel['id'])
+                chapter_nums = [c['chapter_num'] for c in all_chapters]
+            scraper.create_index_file(novel['name'], chapter_nums)
+
+        # Log sync
+        with self.db:
+            latest_available = max(c['num'] for c in chapters)
+            status = 'success' if failed == 0 else 'partial'
+            self.db.add_sync_log(novel['id'], latest_available, len(new_chapters),
+                                 successful, status)
+
+        print(f"\nComplete: {successful} downloaded, {failed} failed")
+
+    def _download_parallel(self, scraper, novel, chapters):
+        """Download chapters in parallel"""
+        max_workers = self.config.max_workers
+        delay = self.config.delay * self.config.get('scraper', 'parallel_delay_multiplier', 2.0)
+
+        print(f"Downloading with {max_workers} workers (delay: {delay}s)")
+
+        successful = 0
+        failed = 0
+        results = {}
+
+        def download_chapter(chapter):
+            # Add jitter
+            time.sleep(random.uniform(delay * 0.7, delay * 1.3))
+
+            title, content = scraper.scrape_chapter_by_url(chapter['url'])
+            if content:
+                filepath, char_count = scraper.save_chapter(novel['name'], chapter['num'], title, content)
+                return chapter['num'], True, title, filepath, char_count
+            return chapter['num'], False, None, None, None
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(download_chapter, ch): ch for ch in chapters}
+
+            for i, future in enumerate(as_completed(futures)):
+                chapter_num, success, title, filepath, char_count = future.result()
+
+                if success:
+                    with self.db:
+                        self.db.add_chapter(novel['id'], chapter_num, title, filepath, char_count)
+                    successful += 1
+                    print(f"[{i+1}/{len(chapters)}] Chapter {chapter_num}: OK ({char_count} chars)")
+                else:
+                    failed += 1
+                    print(f"[{i+1}/{len(chapters)}] Chapter {chapter_num}: FAILED")
+
+        return successful, failed
+
+    def _download_sequential(self, scraper, novel, chapters):
+        """Download chapters sequentially"""
+        delay = self.config.delay
+        successful = 0
+        failed = 0
+
+        for i, chapter in enumerate(chapters):
+            print(f"[{i+1}/{len(chapters)}] Chapter {chapter['num']}...", end=" ", flush=True)
+
+            title, content = scraper.scrape_chapter_by_url(chapter['url'])
+
+            if content:
+                filepath, char_count = scraper.save_chapter(novel['name'], chapter['num'], title, content)
+                with self.db:
+                    self.db.add_chapter(novel['id'], chapter['num'], title, filepath, char_count)
+                print(f"OK ({char_count} chars)")
+                successful += 1
+            else:
+                print("FAILED")
+                failed += 1
+
+            if i < len(chapters) - 1:
+                time.sleep(delay)
+
+        return successful, failed
+
+    def move_to_obsidian(self, name=None, all_novels=False):
+        """Move downloaded chapters to Obsidian vault"""
+        obsidian_path = self.config.obsidian_vault
+        if not obsidian_path:
+            print("Error: Obsidian vault path not configured")
+            print("Run: scrape_novels.py config set obsidian_vault /path/to/vault")
+            return
+
+        obsidian_path = Path(obsidian_path).expanduser()
+        if not obsidian_path.exists():
+            print(f"Error: Obsidian vault path does not exist: {obsidian_path}")
+            return
+
+        with self.db:
+            if all_novels:
+                novels = self.db.list_novels()
+            elif name:
+                novel = self.db.get_novel(name=name)
+                if not novel:
+                    print(f"Error: Novel '{name}' not found")
+                    return
+                novels = [novel]
+            else:
+                print("Error: Specify --name or --all")
+                return
+
+        for novel in novels:
+            self._move_novel_to_obsidian(novel, obsidian_path)
+
+    def _move_novel_to_obsidian(self, novel, obsidian_path):
+        """Move a single novel to Obsidian"""
+        scraper = NovelScraper(self.config)  # Just for folder name helper
+        folder_name = scraper.get_folder_name(novel['name'])
+
+        src_dir = Path(self.config.staging_dir) / folder_name
+        dst_dir = obsidian_path / folder_name
+
+        if not src_dir.exists():
+            print(f"No files to move for: {novel['name']}")
+            return
+
+        # Get chapters not yet in Obsidian
+        with self.db:
+            chapters = self.db.get_chapters(novel['id'], in_obsidian=False)
 
         if not chapters:
-            print("No chapters found in the specified range!")
-            return 0, 0
+            print(f"All chapters already in Obsidian: {novel['name']}")
+            return
 
-        print(f"Scraping {len(chapters)} chapters ({chapters[0]['num']} to {chapters[-1]['num']})")
-        print(f"{'='*60}\n")
+        # Create destination if needed
+        dst_dir.mkdir(parents=True, exist_ok=True)
 
-        self.chapters_saved = []
-        successful = 0
-        failed = 0
-        failed_chapters = []
+        moved = []
+        for chapter in chapters:
+            if chapter['file_path']:
+                src_file = Path(chapter['file_path'])
+                if src_file.exists():
+                    dst_file = dst_dir / src_file.name
+                    shutil.copy2(src_file, dst_file)
+                    moved.append(chapter['chapter_num'])
 
-        total = len(chapters)
-        for i, chapter in enumerate(chapters):
-            chapter_num = chapter['num']
-            chapter_id = chapter['id']
-            print(f"[{i+1}/{total}] Chapter {chapter_num}...", end=" ", flush=True)
+        # Also copy index file
+        index_name = f"{folder_name.replace(' ', '_')}_Index.md"
+        src_index = src_dir / index_name
+        if src_index.exists():
+            shutil.copy2(src_index, dst_dir / index_name)
 
-            title, content = self.scrape_chapter(book_id, chapter_id)
+        # Mark as moved
+        with self.db:
+            self.db.mark_chapters_moved(novel['id'], moved)
 
-            if content:
-                self.save_chapter(novel_name, chapter_num, title, content)
-                print(f"OK ({len(content)} chars)")
-                successful += 1
-            else:
-                print("FAILED")
-                failed += 1
-                failed_chapters.append(chapter_num)
+        print(f"Moved {len(moved)} chapters to Obsidian: {novel['name']}")
 
-            if i < total - 1:
-                time.sleep(delay)
+    def scan_obsidian(self):
+        """Scan Obsidian vault and import existing novels"""
+        obsidian_path = self.config.obsidian_vault
+        if not obsidian_path:
+            print("Error: Obsidian vault path not configured")
+            return
 
-        # Create index file
-        if successful > 0:
-            self.create_index_file(novel_name)
+        obsidian_path = Path(obsidian_path).expanduser()
+        if not obsidian_path.exists():
+            print(f"Error: Path does not exist: {obsidian_path}")
+            return
 
-        self._close_driver()
+        print(f"Scanning: {obsidian_path}\n")
 
-        print(f"\n{'='*60}")
-        print(f"Complete: {successful} successful, {failed} failed")
-        print(f"Output folder: {folder_name}")
-        if failed_chapters:
-            print(f"Failed chapters: {failed_chapters[:20]}{'...' if len(failed_chapters) > 20 else ''}")
-        print(f"{'='*60}")
+        imported_novels = 0
+        imported_chapters = 0
 
-        return successful, failed
+        for novel_dir in obsidian_path.iterdir():
+            if not novel_dir.is_dir():
+                continue
 
-    def _scrape_sequential(self, book_id, novel_name, start_chapter, end_chapter, delay):
-        """Fallback: scrape using sequential chapter IDs (often doesn't work)"""
-        folder_name = self.get_folder_name(novel_name)
+            # Find chapter files
+            chapter_files = list(novel_dir.glob("[0-9][0-9][0-9][0-9] - *.md"))
+            if not chapter_files:
+                continue
 
-        print(f"Trying sequential scraping from chapter {start_chapter} to {end_chapter}")
-        print("Note: This may not work as webnovel.com uses random chapter IDs.")
-        print(f"{'='*60}\n")
+            novel_name = novel_dir.name
+            print(f"Found: {novel_name}/")
 
-        self.chapters_saved = []
-        successful = 0
-        failed = 0
-        consecutive_failures = 0
-        failed_chapters = []
+            # Extract chapter numbers
+            chapter_nums = []
+            for f in chapter_files:
+                match = re.match(r'(\d{4}) - ', f.name)
+                if match:
+                    chapter_nums.append(int(match.group(1)))
 
-        for chapter_num in range(start_chapter, end_chapter + 1):
-            print(f"[{chapter_num}/{end_chapter}] Chapter {chapter_num}...", end=" ", flush=True)
+            if not chapter_nums:
+                continue
 
-            # For sequential, the chapter_id might be the same as chapter_num for some books
-            title, content = self.scrape_chapter(book_id, str(chapter_num))
+            chapter_nums.sort()
+            print(f"  - {len(chapter_nums)} chapters ({min(chapter_nums)}-{max(chapter_nums)})")
 
-            if content:
-                self.save_chapter(novel_name, chapter_num, title, content)
-                print(f"OK ({len(content)} chars)")
-                successful += 1
-                consecutive_failures = 0
-            else:
-                print("FAILED")
-                failed += 1
-                failed_chapters.append(chapter_num)
-                consecutive_failures += 1
+            # Add to database or update existing
+            with self.db:
+                # Check if novel already exists (by name)
+                novel = self.db.get_novel(name=novel_name)
 
-                # Stop if too many consecutive failures
-                if consecutive_failures >= 5:
-                    print(f"\nStopping: {consecutive_failures} consecutive failures")
-                    print("This book likely uses non-sequential chapter IDs.")
-                    break
+                if not novel:
+                    # Add new novel (imported without URL)
+                    try:
+                        self.db.conn.execute("""
+                            INSERT INTO novels (id, name, slug, url, site, status)
+                            VALUES (nextval('novels_id_seq'), ?, ?, ?, ?, ?)
+                        """, [novel_name, novel_name.lower().replace(' ', '-'),
+                              '', 'imported', 'unknown'])
+                        novel = self.db.get_novel(name=novel_name)
+                    except duckdb.ConstraintException:
+                        pass
 
-            if chapter_num < end_chapter:
-                time.sleep(delay)
+                if novel:
+                    for num in chapter_nums:
+                        filepath = str(novel_dir / f"{num:04d} - {novel_name}.md")
+                        self.db.add_chapter(novel['id'], num, None, filepath, None)
+                        self.db.mark_chapters_moved(novel['id'], [num])
+                    imported_chapters += len(chapter_nums)
 
-        # Create index file
-        if successful > 0:
-            self.create_index_file(novel_name)
+            imported_novels += 1
 
-        self._close_driver()
+        print(f"\nImported: {imported_novels} novels, {imported_chapters} chapters")
 
-        print(f"\n{'='*60}")
-        print(f"Complete: {successful} successful, {failed} failed")
-        print(f"Output folder: {folder_name}")
-        if failed_chapters:
-            print(f"Failed chapters: {failed_chapters[:20]}{'...' if len(failed_chapters) > 20 else ''}")
-        print(f"{'='*60}")
 
-        return successful, failed
+# =============================================================================
+# Legacy scrape command (for backwards compatibility)
+# =============================================================================
 
+def legacy_scrape(args, config):
+    """Legacy scrape command for one-time scraping"""
+    scraper, site = get_scraper_for_url(args.url, config)
+    if not scraper:
+        print(f"Error: Unsupported site: {args.url}")
+        return
+
+    slug = extract_slug_from_url(args.url, site)
+    if not slug:
+        print("Error: Could not extract novel slug from URL")
+        return
+
+    print("=" * 60)
+    print("Novel Scraper for Obsidian")
+    print(f"Site: {site}")
+    print(f"Novel: {args.name}")
+    print(f"Slug: {slug}")
+    print(f"Chapters: {args.start} to {args.end}")
+    print(f"Output: {config.staging_dir}")
+    print("=" * 60)
+
+    # Get chapter list
+    chapters = scraper.get_chapter_list(slug)
+    if not chapters:
+        print("Failed to fetch chapter list!")
+        return
+
+    print(f"Found {len(chapters)} chapters")
+
+    # Filter by range
+    chapters = [c for c in chapters if args.start <= c['num'] <= args.end]
+
+    if not chapters:
+        print("No chapters in the specified range!")
+        return
+
+    print(f"Scraping {len(chapters)} chapters\n")
+
+    successful = 0
+    failed = 0
+    chapter_nums = []
+
+    for i, chapter in enumerate(chapters):
+        print(f"[{i+1}/{len(chapters)}] Chapter {chapter['num']}...", end=" ", flush=True)
+
+        title, content = scraper.scrape_chapter_by_url(chapter['url'])
+
+        if content:
+            scraper.save_chapter(args.name, chapter['num'], title, content)
+            chapter_nums.append(chapter['num'])
+            print(f"OK ({len(content)} chars)")
+            successful += 1
+        else:
+            print("FAILED")
+            failed += 1
+
+        if i < len(chapters) - 1:
+            time.sleep(args.delay)
+
+    if successful > 0:
+        scraper.create_index_file(args.name, chapter_nums)
+
+    print(f"\n{'='*60}")
+    print(f"Complete: {successful} successful, {failed} failed")
+    print(f"Output folder: {scraper.get_folder_name(args.name)}")
+    print("=" * 60)
+
+
+# =============================================================================
+# CLI
+# =============================================================================
 
 def main():
-    """CLI interface for scraping novels"""
-    import argparse
+    parser = argparse.ArgumentParser(
+        description='Novel Scraper with DuckDB tracking and Obsidian integration',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Add a novel to track
+  %(prog)s add --url "https://lightnovelstranslations.com/novel/..." --name "Novel Name"
 
-    parser = argparse.ArgumentParser(description='Novel Scraper for Obsidian')
-    parser.add_argument('--url', '-u', required=True, help='Novel URL (freewebnovel.com, webnovel.com)')
-    parser.add_argument('--name', '-n', required=True, help='Novel name for folder/tags')
-    parser.add_argument('--start', '-s', type=int, default=1, help='Start chapter (default: 1)')
-    parser.add_argument('--end', '-e', type=int, required=True, help='End chapter')
-    parser.add_argument('--output', '-o', default='novels_obsidian', help='Output directory (default: novels_obsidian)')
-    parser.add_argument('--delay', '-d', type=float, default=1.5, help='Delay between requests (default: 1.5)')
-    parser.add_argument('--headless', action='store_true', default=True, help='Run browser in headless mode (default: True)')
-    parser.add_argument('--no-headless', action='store_false', dest='headless', help='Show browser window')
+  # Check for new chapters
+  %(prog)s check
+
+  # Download new chapters
+  %(prog)s sync --all
+
+  # Move to Obsidian
+  %(prog)s move --all
+
+  # Legacy one-time scrape
+  %(prog)s scrape --url "..." --name "..." --start 1 --end 100
+        """
+    )
+
+    subparsers = parser.add_subparsers(dest='command', help='Commands')
+
+    # Add command
+    add_parser = subparsers.add_parser('add', help='Add a novel to track')
+    add_parser.add_argument('--url', '-u', required=True, help='Novel URL')
+    add_parser.add_argument('--name', '-n', required=True, help='Novel name')
+
+    # List command
+    list_parser = subparsers.add_parser('list', help='List tracked novels')
+    list_parser.add_argument('--json', action='store_true', help='Output as JSON')
+
+    # Remove command
+    remove_parser = subparsers.add_parser('remove', help='Remove a novel')
+    remove_parser.add_argument('name', help='Novel name')
+
+    # Set status command
+    status_parser = subparsers.add_parser('set-status', help='Set novel status')
+    status_parser.add_argument('name', help='Novel name')
+    status_parser.add_argument('status', choices=['ongoing', 'completed', 'hiatus', 'dropped'],
+                               help='Novel status')
+
+    # Check command
+    check_parser = subparsers.add_parser('check', help='Check for new chapters')
+    check_parser.add_argument('--name', '-n', help='Novel name (or check all)')
+    check_parser.add_argument('--json', action='store_true', help='Output as JSON')
+
+    # Sync command
+    sync_parser = subparsers.add_parser('sync', help='Download new chapters')
+    sync_parser.add_argument('--name', '-n', help='Novel name')
+    sync_parser.add_argument('--all', action='store_true', help='Sync all novels')
+    sync_parser.add_argument('--sequential', action='store_true', help='Download sequentially (not parallel)')
+
+    # Move command
+    move_parser = subparsers.add_parser('move', help='Move chapters to Obsidian')
+    move_parser.add_argument('--name', '-n', help='Novel name')
+    move_parser.add_argument('--all', action='store_true', help='Move all novels')
+
+    # Scan Obsidian command
+    scan_parser = subparsers.add_parser('scan-obsidian', help='Import existing novels from Obsidian')
+
+    # Config command
+    config_parser = subparsers.add_parser('config', help='View/set configuration')
+    config_parser.add_argument('action', choices=['show', 'set'], help='Action')
+    config_parser.add_argument('key', nargs='?', help='Config key (section.key)')
+    config_parser.add_argument('value', nargs='?', help='Value to set')
+
+    # Legacy scrape command
+    scrape_parser = subparsers.add_parser('scrape', help='Legacy: one-time scrape')
+    scrape_parser.add_argument('--url', '-u', required=True, help='Novel URL')
+    scrape_parser.add_argument('--name', '-n', required=True, help='Novel name')
+    scrape_parser.add_argument('--start', '-s', type=int, default=1, help='Start chapter')
+    scrape_parser.add_argument('--end', '-e', type=int, required=True, help='End chapter')
+    scrape_parser.add_argument('--delay', '-d', type=float, default=1.5, help='Delay between requests')
 
     args = parser.parse_args()
 
-    # Detect which site and extract identifier
-    url = args.url.lower()
+    # Load config
+    config = Config()
+    config.load()
 
-    if 'lightnovelstranslations.com' in url:
-        # lightnovelstranslations.com URL patterns:
-        # https://lightnovelstranslations.com/novel/novel-slug/
-        # https://lightnovelstranslations.com/novel/novel-slug/?tab=table_contents
+    # Handle commands
+    if args.command == 'add':
+        manager = NovelManager(config)
+        manager.add_novel(args.url, args.name)
 
-        # Extract novel slug from URL
-        match = re.search(r'/novel/([^/?]+)', args.url)
-        if match:
-            novel_slug = match.group(1)
-        else:
-            print("Error: Could not extract novel slug from lightnovelstranslations.com URL")
-            return
+    elif args.command == 'list':
+        manager = NovelManager(config)
+        manager.list_novels(json_output=args.json)
 
-        print("="*60)
-        print("Novel Scraper for Obsidian")
-        print(f"Site: lightnovelstranslations.com")
-        print(f"Novel: {args.name}")
-        print(f"Slug: {novel_slug}")
-        print(f"Chapters: {args.start} to {args.end}")
-        print(f"Output: {args.output}")
-        print("="*60)
+    elif args.command == 'remove':
+        manager = NovelManager(config)
+        manager.remove_novel(args.name)
 
-        scraper = LightNovelTranslationsScraper(output_dir=args.output)
-        scraper.scrape_range(
-            novel_slug=novel_slug,
-            novel_name=args.name,
-            start_chapter=args.start,
-            end_chapter=args.end,
-            delay=args.delay
-        )
+    elif args.command == 'set-status':
+        manager = NovelManager(config)
+        with manager.db:
+            novel = manager.db.get_novel(name=args.name)
+            if not novel:
+                print(f"Error: Novel '{args.name}' not found")
+            else:
+                manager.db.update_novel(novel['id'], status=args.status)
+                print(f"Set '{args.name}' status to: {args.status}")
 
-    elif 'webnovel.com' in url:
-        # webnovel.com URL patterns:
-        # https://www.webnovel.com/book/345219114701937
-        # https://m.webnovel.com/subject/345219114701937
-        # https://m.webnovel.com/book/345219114701937
+    elif args.command == 'check':
+        manager = NovelManager(config)
+        manager.check_novels(name=args.name, json_output=args.json)
 
-        # Extract book ID (numeric ID from URL)
-        match = re.search(r'(?:book|subject)/(\d+)', args.url)
-        if match:
-            book_id = match.group(1)
-        else:
-            # Try to get last numeric segment
-            parts = args.url.rstrip('/').split('/')
-            book_id = None
-            for part in reversed(parts):
-                if part.isdigit():
-                    book_id = part
-                    break
-            if not book_id:
-                print("Error: Could not extract book ID from webnovel.com URL")
+    elif args.command == 'sync':
+        manager = NovelManager(config)
+        manager.sync_novel(name=args.name, all_novels=args.all, parallel=not args.sequential)
+
+    elif args.command == 'move':
+        manager = NovelManager(config)
+        manager.move_to_obsidian(name=args.name, all_novels=args.all)
+
+    elif args.command == 'scan-obsidian':
+        manager = NovelManager(config)
+        manager.scan_obsidian()
+
+    elif args.command == 'config':
+        if args.action == 'show':
+            print(f"Config file: {config.config_file}")
+            print(f"Local config: {config.local_config_file}")
+            print()
+            print(f"staging_dir: {config.staging_dir}")
+            print(f"obsidian_vault: {config.obsidian_vault or '(not set)'}")
+            print(f"database: {config.database_path}")
+            print(f"delay: {config.delay}")
+            print(f"max_workers: {config.max_workers}")
+        elif args.action == 'set':
+            if not args.key or not args.value:
+                print("Usage: config set <key> <value>")
+                print("Example: config set obsidian_vault /path/to/vault")
                 return
+            # Parse key as section.key or just key (defaults to paths section)
+            if '.' in args.key:
+                section, key = args.key.split('.', 1)
+            else:
+                section = 'paths'
+                key = args.key
+            config.set(section, key, args.value)
+            print(f"Set {section}.{key} = {args.value}")
 
-        print("="*60)
-        print("Novel Scraper for Obsidian")
-        print(f"Site: webnovel.com")
-        print(f"Novel: {args.name}")
-        print(f"Book ID: {book_id}")
-        print(f"Chapters: {args.start} to {args.end}")
-        print(f"Output: {args.output}")
-        print(f"Headless: {args.headless}")
-        print("="*60)
-
-        scraper = WebNovelScraper(output_dir=args.output, headless=args.headless)
-        scraper.scrape_range(
-            book_id=book_id,
-            novel_name=args.name,
-            start_chapter=args.start,
-            end_chapter=args.end,
-            delay=args.delay
-        )
+    elif args.command == 'scrape':
+        legacy_scrape(args, config)
 
     else:
-        # freewebnovel.com (default)
-        # Extract slug from URL
-        # Supports: https://freewebnovel.com/novel-name.html or https://freewebnovel.com/novel/novel-name/...
-        slug = args.url.rstrip('/').split('/')[-1].replace('.html', '')
-        if slug.startswith('chapter-'):
-            slug = args.url.rstrip('/').split('/')[-2]
-
-        print("="*60)
-        print("Novel Scraper for Obsidian")
-        print(f"Site: freewebnovel.com")
-        print(f"Novel: {args.name}")
-        print(f"Slug: {slug}")
-        print(f"Chapters: {args.start} to {args.end}")
-        print(f"Output: {args.output}")
-        print("="*60)
-
-        scraper = FreeWebNovelScraper(output_dir=args.output)
-        scraper.scrape_range(
-            novel_slug=slug,
-            novel_name=args.name,
-            start_chapter=args.start,
-            end_chapter=args.end,
-            delay=args.delay
-        )
+        parser.print_help()
 
 
 if __name__ == "__main__":

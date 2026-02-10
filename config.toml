@@ -1,0 +1,79 @@
+# Novel Scraper Configuration
+# Copy to config.local.toml for machine-specific settings (gitignored)
+
+[paths]
+# Staging folder for downloads (before moving to Obsidian)
+staging_dir = "novels_obsidian"
+
+# Obsidian vault novels path (machine-specific - set in config.local.toml)
+# Windows example: "C:/Users/YourName/Documents/Obsidian/SecondBrain/Novels"
+# Mac example: "/Users/yourname/Obsidian/SecondBrain/Novels"
+obsidian_vault = ""
+
+# Database location
+database = "novels.db"
+
+[scraper]
+# Default delay between requests (seconds)
+delay = 1.5
+
+# Parallel workers for downloading
+max_workers = 4
+
+# Retry attempts for failed chapters
+max_retries = 3
+
+# Delay multiplier for parallel mode (to avoid rate limiting)
+parallel_delay_multiplier = 2.0
+
+[blogs]
+# Staging folder for blog downloads (before moving to Obsidian)
+staging_dir = "blogs_obsidian"
+
+# Obsidian vault blogs path (machine-specific - set in config.local.toml)
+obsidian_vault = ""
+
+# Database location (separate from novels.db)
+database = "blogs.db"
+
+# Delay between requests (seconds)
+delay = 1.0
+
+# Retry attempts for failed posts
+max_retries = 3
+
+# Parallel workers (used with --parallel flag)
+max_workers = 4
+
+[medium]
+# Staging folder for Medium downloads (before moving to Obsidian)
+staging_dir = "medium_obsidian"
+
+# Obsidian vault path (machine-specific - set in config.local.toml)
+obsidian_vault = ""
+
+# Database location (separate from novels.db and blogs.db)
+database = "medium.db"
+
+# Delay between requests (seconds)
+delay = 1.0
+
+# Retry attempts for failed posts
+max_retries = 3
+
+# Parallel workers (used with --parallel flag)
+max_workers = 4
+
+# Tracked Medium usernames (without @)
+users = []
+
+[notifications]
+# Enable notifications on new chapters
+enabled = false
+
+# Discord webhook URL (optional)
+discord_webhook = ""
+
+# Telegram settings (optional)
+telegram_bot_token = ""
+telegram_chat_id = ""

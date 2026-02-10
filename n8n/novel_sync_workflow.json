@@ -1,0 +1,235 @@
+{
+  "name": "Novel Sync Workflow",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "hoursInterval": 6
+            }
+          ]
+        }
+      },
+      "id": "schedule-trigger",
+      "name": "Schedule Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [0, 0],
+      "notes": "Runs every 6 hours. Adjust as needed."
+    },
+    {
+      "parameters": {
+        "command": "={{ $json.scriptPath }} check --json"
+      },
+      "id": "check-chapters",
+      "name": "Check for New Chapters",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [220, 0],
+      "notes": "Runs the check command to see if new chapters are available"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse the check output\nconst output = $input.first().json.stdout;\nlet results = [];\n\ntry {\n  results = JSON.parse(output);\n} catch (e) {\n  // Not JSON, parse text output\n  return [{ json: { hasNew: false, novels: [] } }];\n}\n\n// Check if any novels have new chapters\nconst novelsWithNew = results.filter(r => r.new > 0);\nconst hasNew = novelsWithNew.length > 0;\n\nreturn [{\n  json: {\n    hasNew,\n    totalNew: novelsWithNew.reduce((sum, r) => sum + r.new, 0),\n    novels: novelsWithNew,\n    scriptPath: $('Set Script Path').first().json.scriptPath\n  }\n}];"
+      },
+      "id": "parse-check-result",
+      "name": "Parse Check Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [440, 0]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "has-new-chapters",
+              "leftValue": "={{ $json.hasNew }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "if-new-chapters",
+      "name": "New Chapters?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [660, 0]
+    },
+    {
+      "parameters": {
+        "command": "={{ $json.scriptPath }} sync --all"
+      },
+      "id": "sync-chapters",
+      "name": "Sync New Chapters",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [880, -100],
+      "notes": "Downloads all new chapters"
+    },
+    {
+      "parameters": {
+        "command": "={{ $('Parse Check Result').first().json.scriptPath }} move --all"
+      },
+      "id": "move-to-obsidian",
+      "name": "Move to Obsidian",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [1100, -100],
+      "notes": "Moves downloaded chapters to Obsidian vault"
+    },
+    {
+      "parameters": {
+        "jsCode": "const checkResult = $('Parse Check Result').first().json;\nconst novels = checkResult.novels;\n\nlet message = `📚 Novel Sync Complete!\\n\\n`;\nmessage += `Found ${checkResult.totalNew} new chapters:\\n\\n`;\n\nfor (const novel of novels) {\n  message += `• ${novel.name}: +${novel.new} (${novel.local} → ${novel.available})\\n`;\n}\n\nreturn [{ json: { message } }];"
+      },
+      "id": "format-notification",
+      "name": "Format Notification",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1320, -100]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "script-path",
+              "name": "scriptPath",
+              "value": "uv run python /path/to/scrape_novels.py",
+              "type": "string"
+            }
+          ]
+        }
+      },
+      "id": "set-script-path",
+      "name": "Set Script Path",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [0, -150],
+      "notes": "CONFIGURE THIS: Set the path to your scrape_novels.py script"
+    },
+    {
+      "parameters": {},
+      "id": "no-new-chapters",
+      "name": "No New Chapters",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [880, 100],
+      "notes": "No action needed - all novels up to date"
+    }
+  ],
+  "connections": {
+    "Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "Set Script Path",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Set Script Path": {
+      "main": [
+        [
+          {
+            "node": "Check for New Chapters",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check for New Chapters": {
+      "main": [
+        [
+          {
+            "node": "Parse Check Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Check Result": {
+      "main": [
+        [
+          {
+            "node": "New Chapters?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "New Chapters?": {
+      "main": [
+        [
+          {
+            "node": "Sync New Chapters",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "No New Chapters",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sync New Chapters": {
+      "main": [
+        [
+          {
+            "node": "Move to Obsidian",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Move to Obsidian": {
+      "main": [
+        [
+          {
+            "node": "Format Notification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "staticData": null,
+  "tags": [
+    {
+      "name": "novels"
+    },
+    {
+      "name": "automation"
+    }
+  ],
+  "triggerCount": 1,
+  "meta": {
+    "instanceId": "novel-scraper-workflow"
+  }
+}
