@@ -624,3 +624,260 @@ uv run python scrape_medium.py scrape
 - Graceful Ctrl+C shutdown (preserves DB state, can resume later)
 - Use `retry` command to reset failed posts for re-download
 - Re-running `scrape` only processes `pending` posts (already converted ones are skipped)
+
+---
+
+# Raindrop.io Bookmark Scraper (`scrape_raindrop.py`)
+
+## Overview
+
+Scrapes web pages bookmarked in Raindrop.io and saves them as Obsidian markdown with tags `clippings`, `raindrop` (plus user's Raindrop tags). Uses the Raindrop.io REST API to fetch bookmarks, then scrapes the actual web pages for content. Medium URLs are optionally routed to the Medium scraper instead of being scraped directly.
+
+## How It Works
+
+1. **Discover**: Fetches all bookmarks from Raindrop.io API (`GET /rest/v1/raindrops/0`), paginates automatically
+2. **Medium Routing**: Medium URLs detected during discover are marked `skipped_medium` and inserted into `medium.db` as pending — picked up by the next Medium scrape run
+3. **Scrape**: Fetches HTML from each bookmarked URL, extracts article/main content, converts to markdown
+
+## How to Run
+
+```bash
+uv run python scrape_raindrop.py <command> [options]
+```
+
+## Commands
+
+### Discovery
+
+```bash
+# Fetch bookmarks from Raindrop.io API
+uv run python scrape_raindrop.py discover
+
+# Discover without routing Medium URLs
+uv run python scrape_raindrop.py discover --no-route-medium
+```
+
+### Scraping
+
+```bash
+# Download all pending bookmarks (sequential, default)
+uv run python scrape_raindrop.py scrape
+
+# Download in parallel (4 workers by default)
+uv run python scrape_raindrop.py scrape --parallel
+
+# Download with custom worker count
+uv run python scrape_raindrop.py scrape --workers 8
+
+# Download a single bookmark by Raindrop ID
+uv run python scrape_raindrop.py scrape --id 123456
+
+# Download first N pending bookmarks
+uv run python scrape_raindrop.py scrape --limit 10
+```
+
+### Listing & Status
+
+```bash
+# List all bookmarks
+uv run python scrape_raindrop.py list
+
+# Filter by status
+uv run python scrape_raindrop.py list --status pending
+uv run python scrape_raindrop.py list --status downloaded
+uv run python scrape_raindrop.py list --status failed
+uv run python scrape_raindrop.py list --status skipped_medium
+
+# JSON output
+uv run python scrape_raindrop.py list --json
+
+# Summary statistics
+uv run python scrape_raindrop.py status
+```
+
+### Obsidian Integration
+
+```bash
+# Move downloaded bookmarks to Obsidian vault
+uv run python scrape_raindrop.py move --all
+```
+
+### Error Recovery
+
+```bash
+# Reset failed bookmarks back to pending for retry
+uv run python scrape_raindrop.py retry
+```
+
+### Failure Diagnosis (`fix`)
+
+```bash
+# Show detailed failure report (for LLM consumption / debugging)
+uv run python scrape_raindrop.py fix
+
+# JSON output (for piping to LLM tools)
+uv run python scrape_raindrop.py fix --json
+
+# Show details for a single bookmark
+uv run python scrape_raindrop.py fix --id 123456
+
+# Limit output
+uv run python scrape_raindrop.py fix --limit 5
+
+# Auto-fix via Ollama (requires ollama_url config — not yet implemented)
+uv run python scrape_raindrop.py fix --auto
+```
+
+The `fix` command outputs error reason, detail, and an HTML preview for each failed bookmark. Error categories: `http_XXX` (HTTP errors), `timeout`, `no_content`, `parse_error`, `connection_error`.
+
+### Configuration
+
+```bash
+# View current config
+uv run python scrape_raindrop.py config show
+
+# Set Raindrop API token
+uv run python scrape_raindrop.py config set test_token "YOUR_TOKEN"
+
+# Set Obsidian vault path
+uv run python scrape_raindrop.py config set obsidian_vault "/path/to/vault/Bookmarks"
+
+# Set delay between requests
+uv run python scrape_raindrop.py config set delay 2.0
+
+# Disable Medium routing
+uv run python scrape_raindrop.py config set route_medium false
+```
+
+## Configuration
+
+Settings live in `config.toml` under the `[raindrop]` section:
+
+```toml
+[raindrop]
+test_token = ""                   # API token (set in config.local.toml)
+staging_dir = "raindrop_obsidian" # Download folder
+obsidian_vault = ""               # Obsidian vault path (set in config.local.toml)
+database = "raindrop.db"          # DuckDB file
+delay = 1.0                       # Delay between requests (seconds)
+max_retries = 3                   # Retry attempts per bookmark
+max_workers = 4                   # Parallel workers (used with --parallel)
+route_medium = true               # Route Medium URLs to Medium scraper
+medium_domains = []               # Extra Medium publication custom domains
+```
+
+Machine-specific overrides go in `config.local.toml` (gitignored).
+
+### Getting a Raindrop API Token
+
+1. Go to https://app.raindrop.io/settings/integrations
+2. Click "Create new app"
+3. Copy the "Test token"
+4. `uv run python scrape_raindrop.py config set test_token "YOUR_TOKEN"`
+
+## Medium URL Routing
+
+When `route_medium = true` (default), Medium URLs are detected during `discover` and routed to the Medium scraper:
+
+- URLs on `medium.com`, `*.medium.com`, and known Medium publication domains are detected
+- Routed bookmarks are marked `skipped_medium` in `raindrop.db`
+- A pending entry is inserted directly into `medium.db`
+- The next `scrape_medium.py scrape` run processes these routed posts
+- All four pipelines run in parallel in n8n, so routed posts are picked up the same day
+
+Built-in Medium domain detection includes: `towardsdatascience.com`, `betterprogramming.pub`, `levelup.gitconnected.com`, `javascript.plainenglish.io`, `blog.devgenius.io`, `itnext.io`, and more. Add custom domains via `medium_domains` config.
+
+## Output Format
+
+Files are named by title (not URL):
+
+```
+raindrop_obsidian/
+└── Raindrop/
+    ├── Some Interesting Article.md
+    ├── How to Build a Data Pipeline.md
+    └── ...
+```
+
+Each bookmark uses the Obsidian clipping format with merged tags:
+
+```yaml
+---
+title: "Article Title"
+source: "https://example.com/article"
+author:
+  - "[[Author Name]]"
+published: 2025-03-15
+created: 2026-02-15
+description: "Meta description from page"
+tags:
+  - "clippings"
+  - "raindrop"
+  - "user-tag-from-raindrop"
+  - "another-tag"
+---
+```
+
+## Database Schema (`raindrop.db`)
+
+```sql
+raindrop_bookmarks (id, raindrop_id, url, title, domain, excerpt, note,
+                    author, tags, bookmark_type, raindrop_created,
+                    raindrop_updated, cover_url, word_count, char_count,
+                    file_path, status, routed_to, downloaded_at,
+                    in_obsidian, moved_at, created_at)
+
+raindrop_sync_logs (id, synced_at, total_in_api, new_bookmarks_found,
+                    bookmarks_downloaded, bookmarks_failed,
+                    bookmarks_routed_medium, status)
+```
+
+Bookmark statuses: `pending` -> `downloaded` or `failed` or `skipped_medium`
+
+## Architecture (4 classes)
+
+```
+Config            - Reads [raindrop] section from config.toml
+RaindropDatabase  - DuckDB wrapper (raindrop_bookmarks + raindrop_sync_logs)
+RaindropScraper   - Raindrop API, Medium detection, HTML-to-markdown
+RaindropManager   - Orchestrator (discover, scrape, move, etc.)
+```
+
+## Typical Workflow
+
+```bash
+# Initial setup
+uv run python scrape_raindrop.py config set test_token "YOUR_TOKEN"
+uv run python scrape_raindrop.py config set obsidian_vault "~/Obsidian/Vault/Bookmarks"
+
+# Discover bookmarks from Raindrop.io
+uv run python scrape_raindrop.py discover
+
+# Download pages as markdown
+uv run python scrape_raindrop.py scrape --parallel
+
+# Check progress
+uv run python scrape_raindrop.py status
+
+# Move to Obsidian
+uv run python scrape_raindrop.py move --all
+
+# Later: discover new bookmarks
+uv run python scrape_raindrop.py discover
+uv run python scrape_raindrop.py scrape --parallel
+```
+
+## Error Handling
+
+- Per-bookmark retry with exponential backoff (1s, 2s, 4s)
+- Content validation (< 100 chars = failed)
+- **Detailed failure logging** — error reason, detail message, and raw HTML snippet (first 5000 chars) stored in DB
+- Error categories: `http_XXX`, `timeout`, `no_content`, `parse_error`, `connection_error`
+- Use `fix` command to inspect failure details (human-readable or JSON)
+- Graceful Ctrl+C shutdown (preserves DB state, can resume later)
+- Use `retry` command to reset failed bookmarks for re-download (clears error fields)
+- Re-running `scrape` only processes `pending` bookmarks (already downloaded ones are skipped)
+
+### Medium Auth for Routed Posts
+
+When Raindrop routes Medium URLs to the Medium scraper, member-only posts require authentication. Set `sid` and `uid` cookies in `config.local.toml` under `[medium]` — see the Medium scraper section above for details.

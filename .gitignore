@@ -6,6 +6,7 @@ novels/
 novels_obsidian/
 blogs_obsidian/
 medium_obsidian/
+raindrop_obsidian/
 
 # Python-generated files
 __pycache__/
@@ -25,3 +26,4 @@ config.local.toml
 novels.db
 blogs.db
 medium.db
+raindrop.db

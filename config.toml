@@ -67,6 +67,38 @@ max_workers = 4
 # Tracked Medium usernames (without @)
 users = []
 
+[raindrop]
+# Raindrop.io API test token (machine-specific - set in config.local.toml)
+test_token = ""
+
+# Staging folder for bookmark downloads (before moving to Obsidian)
+staging_dir = "raindrop_obsidian"
+
+# Obsidian vault path (machine-specific - set in config.local.toml)
+obsidian_vault = ""
+
+# Database location (separate from other scrapers)
+database = "raindrop.db"
+
+# Delay between requests (seconds)
+delay = 1.0
+
+# Retry attempts for failed bookmarks
+max_retries = 3
+
+# Parallel workers (used with --parallel flag)
+max_workers = 4
+
+# Route Medium URLs to Medium scraper instead of scraping directly
+route_medium = true
+
+# Additional Medium publication custom domains (beyond built-in list)
+medium_domains = []
+
+# Ollama settings for auto-fix (optional, used by `fix --auto`)
+ollama_url = ""
+ollama_model = ""
+
 [notifications]
 # Enable notifications on new chapters
 enabled = false
