@@ -36,6 +36,13 @@ import duckdb
 import requests
 from bs4 import BeautifulSoup
 
+try:
+    from youtube_transcript_api import YouTubeTranscriptApi
+    from youtube_transcript_api._errors import TranscriptsDisabled, NoTranscriptFound, VideoUnavailable
+    HAS_YOUTUBE_TRANSCRIPT = True
+except ImportError:
+    HAS_YOUTUBE_TRANSCRIPT = False
+
 
 # =============================================================================
 # Configuration
@@ -523,6 +530,143 @@ class RaindropScraper:
             return slug or None
         except Exception:
             return None
+
+    # -------------------------------------------------------------------------
+    # YouTube URL detection and transcript fetching
+    # -------------------------------------------------------------------------
+
+    def is_youtube_url(self, url):
+        """Check if a URL is a YouTube video.
+
+        Detects: youtube.com, youtu.be, m.youtube.com
+        """
+        try:
+            parsed = urlparse(url)
+            hostname = parsed.hostname or ''
+        except Exception:
+            return False
+
+        return hostname in ('youtube.com', 'www.youtube.com', 'm.youtube.com', 'youtu.be')
+
+    def _extract_video_id(self, url):
+        """Extract video ID from a YouTube URL.
+
+        Handles /watch?v=ID, youtu.be/ID, /shorts/ID, /embed/ID
+        """
+        try:
+            parsed = urlparse(url)
+            hostname = parsed.hostname or ''
+
+            if hostname == 'youtu.be':
+                return parsed.path.strip('/')
+
+            path = parsed.path
+            if path.startswith('/watch'):
+                from urllib.parse import parse_qs
+                params = parse_qs(parsed.query)
+                ids = params.get('v', [])
+                return ids[0] if ids else None
+            for prefix in ('/shorts/', '/embed/', '/v/'):
+                if path.startswith(prefix):
+                    return path[len(prefix):].strip('/').split('/')[0]
+
+            return None
+        except Exception:
+            return None
+
+    def fetch_youtube_content(self, url, retries=3):
+        """Fetch YouTube video transcript and metadata.
+
+        Returns dict on success: {title, author, date, description, content}
+        Returns error dict on failure: {error: True, reason, detail, html}
+        """
+        video_id = self._extract_video_id(url)
+        if not video_id:
+            return {
+                'error': True,
+                'reason': 'parse_error',
+                'detail': f'Could not extract video ID from {url}',
+                'html': '',
+            }
+
+        # Fetch metadata via oEmbed (no API key needed)
+        title = None
+        author = None
+        try:
+            oembed_resp = requests.get(
+                'https://www.youtube.com/oembed',
+                params={'url': url, 'format': 'json'},
+                timeout=15,
+            )
+            if oembed_resp.status_code == 200:
+                oembed = oembed_resp.json()
+                title = oembed.get('title')
+                author = oembed.get('author_name')
+        except Exception:
+            pass
+
+        # Fetch transcript
+        last_error = None
+        for attempt in range(retries):
+            try:
+                ytt = YouTubeTranscriptApi()
+                try:
+                    transcript = ytt.fetch(video_id, languages=['en', 'en-US', 'en-GB'])
+                except (NoTranscriptFound,):
+                    # Fallback: get first available transcript
+                    transcript_list = ytt.list(video_id)
+                    first = next(iter(transcript_list))
+                    transcript = ytt.fetch(video_id, languages=[first.language_code])
+
+                # Format transcript as plain text paragraphs
+                snippets = [snippet.text for snippet in transcript.snippets]
+                transcript_text = '\n\n'.join(snippets)
+
+                # Build content
+                content_parts = [
+                    f'**Video:** [{title or "YouTube Video"}]({url})',
+                ]
+                if author:
+                    content_parts.append(f'**Channel:** {author}')
+                content_parts.append('')
+                content_parts.append('## Transcript')
+                content_parts.append('')
+                content_parts.append(transcript_text)
+
+                content = '\n'.join(content_parts)
+
+                return {
+                    'title': title or f'YouTube - {video_id}',
+                    'author': author,
+                    'date': None,
+                    'description': f'Transcript of YouTube video {video_id}',
+                    'content': content,
+                }
+
+            except (TranscriptsDisabled, VideoUnavailable) as e:
+                # Non-retryable
+                return {
+                    'error': True,
+                    'reason': 'no_content',
+                    'detail': f'{type(e).__name__}: {e}',
+                    'html': '',
+                }
+
+            except Exception as e:
+                last_error = {
+                    'error': True,
+                    'reason': 'parse_error',
+                    'detail': f'{type(e).__name__}: {e}',
+                    'html': '',
+                }
+                if attempt < retries - 1:
+                    time.sleep(2 ** attempt)
+                else:
+                    return last_error
+
+        return last_error or {
+            'error': True, 'reason': 'unknown', 'detail': 'All retries exhausted', 'html': ''
+        }
 
     # -------------------------------------------------------------------------
     # Page scraping
@@ -1111,9 +1255,14 @@ class RaindropManager:
             title_display = (bm.get('title') or bm['url'])[:60]
             print(f"[{i+1}/{len(bookmarks)}] {title_display}...", end=" ", flush=True)
 
-            result = scraper.fetch_page_content(
-                bm['url'], retries=self.config.max_retries
-            )
+            if HAS_YOUTUBE_TRANSCRIPT and scraper.is_youtube_url(bm['url']):
+                result = scraper.fetch_youtube_content(
+                    bm['url'], retries=self.config.max_retries
+                )
+            else:
+                result = scraper.fetch_page_content(
+                    bm['url'], retries=self.config.max_retries
+                )
 
             if result and not result.get('error') and result.get('content') and len(result['content']) >= 100:
                 filepath = self._save_bookmark(bm, result)
@@ -1180,9 +1329,14 @@ class RaindropManager:
             if self._shutdown:
                 return None
 
-            result = scraper.fetch_page_content(
-                bm['url'], retries=self.config.max_retries
-            )
+            if HAS_YOUTUBE_TRANSCRIPT and scraper.is_youtube_url(bm['url']):
+                result = scraper.fetch_youtube_content(
+                    bm['url'], retries=self.config.max_retries
+                )
+            else:
+                result = scraper.fetch_page_content(
+                    bm['url'], retries=self.config.max_retries
+                )
 
             with counter_lock:
                 completed += 1
@@ -1270,9 +1424,21 @@ class RaindropManager:
 
         print(f"\nComplete: {successful} downloaded, {failed} failed")
 
+    def _is_youtube_bookmark(self, bookmark):
+        """Check if a bookmark URL is a YouTube video."""
+        url = bookmark.get('url', '')
+        try:
+            parsed = urlparse(url)
+            hostname = parsed.hostname or ''
+        except Exception:
+            return False
+        return hostname in ('youtube.com', 'www.youtube.com', 'm.youtube.com', 'youtu.be')
+
     def _save_bookmark(self, bookmark, result):
         """Save a bookmark as Obsidian markdown with merged tags."""
-        output_dir = Path(self.config.staging_dir) / 'Raindrop'
+        is_youtube = self._is_youtube_bookmark(bookmark)
+        subfolder = 'YouTube' if is_youtube else 'Raindrop'
+        output_dir = Path(self.config.staging_dir) / subfolder
         output_dir.mkdir(parents=True, exist_ok=True)
 
         title = result.get('title') or bookmark.get('title') or 'Untitled'
@@ -1291,6 +1457,8 @@ class RaindropManager:
 
         # Merge tags: base tags + Raindrop user tags
         base_tags = ['clippings', 'raindrop']
+        if is_youtube:
+            base_tags.append('youtube')
         user_tags_raw = bookmark.get('tags')
         user_tags = []
         if user_tags_raw:
@@ -1392,9 +1560,6 @@ class RaindropManager:
             print(f"Error: Obsidian vault path does not exist: {obsidian_path}")
             return
 
-        dst_dir = obsidian_path / 'Raindrop'
-        dst_dir.mkdir(parents=True, exist_ok=True)
-
         with self.db:
             bookmarks = self.db.get_unmoved_bookmarks()
 
@@ -1406,6 +1571,12 @@ class RaindropManager:
         for bm in bookmarks:
             src_file = Path(bm['file_path'])
             if src_file.exists():
+                # Route YouTube files to YouTube subfolder, others to Raindrop
+                if '/YouTube/' in bm['file_path']:
+                    dst_dir = obsidian_path / 'YouTube'
+                else:
+                    dst_dir = obsidian_path / 'Raindrop'
+                dst_dir.mkdir(parents=True, exist_ok=True)
                 dst_file = dst_dir / src_file.name
                 shutil.copy2(src_file, dst_file)
                 moved_ids.append(bm['raindrop_id'])
@@ -1413,7 +1584,7 @@ class RaindropManager:
         with self.db:
             self.db.mark_moved(moved_ids)
 
-        print(f"Moved {len(moved_ids)} bookmarks to: {dst_dir}")
+        print(f"Moved {len(moved_ids)} bookmarks to: {obsidian_path}")
 
     def retry_failed(self):
         """Reset failed bookmarks to pending"""

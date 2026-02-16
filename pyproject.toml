@@ -12,4 +12,5 @@ dependencies = [
     "requests>=2.32.4",
     "selenium>=4.33.0",
     "webdriver-manager>=4.0.2",
+    "youtube-transcript-api>=1.0.0",
 ]

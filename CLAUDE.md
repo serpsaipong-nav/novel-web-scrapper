@@ -184,7 +184,7 @@ uv run python scrape_novels.py move --all
 
 ## Overview
 
-Scrapes all Databricks blog posts (~2,600+) and saves them as Obsidian markdown with tags `clipping`, `databricks`. Uses Gatsby page-data JSON endpoints (no browser required).
+Scrapes all Databricks blog posts (~2,600+) and glossary pages (~157) and saves them as Obsidian markdown. Blog posts get tags `clippings`, `databricks`; glossary pages get tags `clippings`, `databricks`, `glossary`. Uses Gatsby page-data JSON endpoints (no browser required).
 
 ## How It Works
 
@@ -192,6 +192,7 @@ Databricks blog is a Gatsby static site backed by Drupal CMS. Each blog post has
 
 - **New posts**: `/en-blog-assets/page-data/blog/{slug}/page-data.json`
 - **Legacy posts**: `/blog-legacy-assets/page-data/blog/{YYYY/MM/DD/slug.html}/page-data.json`
+- **Glossary pages**: `/glossaries-assets/page-data/glossary/{slug}/page-data.json`
 
 The scraper fetches these JSON endpoints directly with `requests` - no Selenium, no browser, no JS rendering needed.
 
@@ -206,14 +207,20 @@ uv run python scrape_blogs.py <command> [options]
 ### Discovery
 
 ```bash
-# Fetch sitemap and add new blog post URLs to database
+# Fetch sitemaps and add new blog + glossary URLs to database
 uv run python scrape_blogs.py discover
 ```
 
-This walks the Databricks sitemap hierarchy:
+This walks both Databricks sitemaps:
+
+**Blog posts:**
 1. `sitemap-index.xml` (top-level)
 2. `en-blog-assets/sitemap/sitemap-index.xml` + `blog-legacy-assets/sitemap/sitemap-index.xml`
 3. Individual `sitemap-0.xml` files containing blog URLs
+
+**Glossary pages:**
+1. `glossaries-assets/sitemap/sitemap-index.xml`
+2. Individual `sitemap-0.xml` files containing glossary URLs (English only)
 
 ### Scraping
 
@@ -303,14 +310,18 @@ Machine-specific overrides go in `config.local.toml` (gitignored).
 
 ## Output Format
 
-Files are named by title (not slug):
+Files are named by title (not slug), stored in separate subfolders:
 
 ```
 blogs_obsidian/
-└── Databricks/
-    ├── Delta Lake Explained.md
-    ├── Databricks Lakebase is now Generally Available.md
-    └── Introducing Apache Spark 2.4.md
+├── Databricks/
+│   ├── Delta Lake Explained.md
+│   ├── Databricks Lakebase is now Generally Available.md
+│   └── Introducing Apache Spark 2.4.md
+└── Databricks Glossary/
+    ├── What is Data Engineering.md
+    ├── What is Delta Lake.md
+    └── What is a Data Lakehouse.md
 ```
 
 Each post uses the Obsidian clipping format:
@@ -341,7 +352,7 @@ tags:
 ```sql
 blog_posts (id, slug, url, title, author, publish_date, categories,
             word_count, char_count, file_path, status, downloaded_at,
-            in_obsidian, moved_at, created_at)
+            in_obsidian, moved_at, created_at, content_type)
 
 blog_sync_logs (id, synced_at, total_in_sitemap, new_posts_found,
                 posts_downloaded, posts_failed, status)
@@ -349,12 +360,15 @@ blog_sync_logs (id, synced_at, total_in_sitemap, new_posts_found,
 
 Post statuses: `pending` -> `downloaded` or `failed`
 
+Content types: `blog` (default) or `glossary`
+
 ## URL Patterns & Slugs
 
-| Type | Blog URL | Database Slug |
-|------|----------|---------------|
-| New | `https://www.databricks.com/blog/some-slug` | `some-slug` |
-| Legacy | `https://www.databricks.com/blog/2020/09/15/some-slug.html` | `2020-09-15-some-slug` |
+| Type | URL | Database Slug | content_type |
+|------|-----|---------------|-------------|
+| New blog | `https://www.databricks.com/blog/some-slug` | `some-slug` | `blog` |
+| Legacy blog | `https://www.databricks.com/blog/2020/09/15/some-slug.html` | `2020-09-15-some-slug` | `blog` |
+| Glossary | `https://www.databricks.com/glossary/data-engineering` | `glossary-data-engineering` | `glossary` |
 
 ## Architecture (4 classes)
 
@@ -631,13 +645,14 @@ uv run python scrape_medium.py scrape
 
 ## Overview
 
-Scrapes web pages bookmarked in Raindrop.io and saves them as Obsidian markdown with tags `clippings`, `raindrop` (plus user's Raindrop tags). Uses the Raindrop.io REST API to fetch bookmarks, then scrapes the actual web pages for content. Medium URLs are optionally routed to the Medium scraper instead of being scraped directly.
+Scrapes web pages bookmarked in Raindrop.io and saves them as Obsidian markdown with tags `clippings`, `raindrop` (plus user's Raindrop tags). Uses the Raindrop.io REST API to fetch bookmarks, then scrapes the actual web pages for content. Medium URLs are optionally routed to the Medium scraper instead of being scraped directly. YouTube URLs are automatically detected during scrape and handled via `youtube-transcript-api` to fetch video transcripts.
 
 ## How It Works
 
 1. **Discover**: Fetches all bookmarks from Raindrop.io API (`GET /rest/v1/raindrops/0`), paginates automatically
 2. **Medium Routing**: Medium URLs detected during discover are marked `skipped_medium` and inserted into `medium.db` as pending — picked up by the next Medium scrape run
 3. **Scrape**: Fetches HTML from each bookmarked URL, extracts article/main content, converts to markdown
+4. **YouTube Handling**: YouTube URLs are automatically detected during scrape and handled via `youtube-transcript-api` — fetches video transcript + metadata via oEmbed, saves to `YouTube/` subfolder with `youtube` tag
 
 ## How to Run
 
@@ -787,15 +802,32 @@ When `route_medium = true` (default), Medium URLs are detected during `discover`
 
 Built-in Medium domain detection includes: `towardsdatascience.com`, `betterprogramming.pub`, `levelup.gitconnected.com`, `javascript.plainenglish.io`, `blog.devgenius.io`, `itnext.io`, and more. Add custom domains via `medium_domains` config.
 
+## YouTube Transcript Support
+
+YouTube URLs (`youtube.com`, `youtu.be`, `m.youtube.com`) are automatically detected during `scrape` and handled via `youtube-transcript-api` instead of regular page scraping. No configuration needed.
+
+- **Detection**: Automatic by URL domain during scrape (not during discover)
+- **Metadata**: Fetched via YouTube oEmbed API (no API key needed) — gets title and channel name
+- **Transcript**: Fetched via `youtube-transcript-api` — prefers English, falls back to first available language
+- **Output**: Saved to `YouTube/` subfolder with tags `clippings`, `raindrop`, `youtube`
+- **Errors**: `TranscriptsDisabled` and `VideoUnavailable` are non-retryable; network errors use exponential backoff
+- **Dependency**: Requires `youtube-transcript-api` package (in `pyproject.toml`). Gracefully degrades if not installed — YouTube URLs fall back to regular page scraping
+
+URL patterns handled: `/watch?v=ID`, `youtu.be/ID`, `/shorts/ID`, `/embed/ID`
+
 ## Output Format
 
-Files are named by title (not URL):
+Files are named by title (not URL), with YouTube videos in a separate subfolder:
 
 ```
 raindrop_obsidian/
-└── Raindrop/
-    ├── Some Interesting Article.md
-    ├── How to Build a Data Pipeline.md
+├── Raindrop/
+│   ├── Some Interesting Article.md
+│   ├── How to Build a Data Pipeline.md
+│   └── ...
+└── YouTube/
+    ├── How to Use Delta Lake.md
+    ├── Apache Spark Tutorial.md
     └── ...
 ```
 
@@ -839,7 +871,7 @@ Bookmark statuses: `pending` -> `downloaded` or `failed` or `skipped_medium`
 ```
 Config            - Reads [raindrop] section from config.toml
 RaindropDatabase  - DuckDB wrapper (raindrop_bookmarks + raindrop_sync_logs)
-RaindropScraper   - Raindrop API, Medium detection, HTML-to-markdown
+RaindropScraper   - Raindrop API, Medium detection, YouTube transcript, HTML-to-markdown
 RaindropManager   - Orchestrator (discover, scrape, move, etc.)
 ```
 
