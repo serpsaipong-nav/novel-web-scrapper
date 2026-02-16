@@ -1243,6 +1243,13 @@ class MediumManager:
         progress_lock = threading.Lock()
         completed = 0
 
+        # Pre-fetch full post data (including content_html) on main thread
+        # DuckDB connections are not thread-safe, so all DB reads happen here
+        full_posts = {}
+        with self.db:
+            for p in posts:
+                full_posts[p['slug']] = self.db.get_post(p['slug'])
+
         def _fetch_post(post):
             """Fetch and convert a single post (no DB writes)."""
             nonlocal completed
@@ -1251,9 +1258,7 @@ class MediumManager:
                 return None
 
             slug = post['slug']
-
-            with self.db:
-                full_post = self.db.get_post(slug)
+            full_post = full_posts.get(slug)
 
             content_html = full_post.get('content_html') if full_post else None
             content = self.scraper.parse_post_from_html(content_html)

@@ -881,3 +881,213 @@ uv run python scrape_raindrop.py scrape --parallel
 ### Medium Auth for Routed Posts
 
 When Raindrop routes Medium URLs to the Medium scraper, member-only posts require authentication. Set `sid` and `uid` cookies in `config.local.toml` under `[medium]` — see the Medium scraper section above for details.
+
+---
+
+# Daily Sync (`sync_all.sh`)
+
+## Overview
+
+`sync_all.sh` is a single shell script that replaces the Docker/n8n orchestration (`daily-pipeline` project). It runs all 4 scraper pipelines in parallel with zero overhead — no Docker, no n8n, just bash + macOS launchd.
+
+## How It Works
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      sync_all.sh                            │
+│                                                             │
+│  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────────┐  │
+│  │  Novels  │ │  Blogs   │ │  Medium  │ │   Raindrop   │  │
+│  │          │ │          │ │          │ │              │  │
+│  │ check    │ │ discover │ │ discover │ │ discover     │  │
+│  │ ↓        │ │ ↓        │ │ ↓        │ │ ↓            │  │
+│  │ sync?    │ │ scrape   │ │ scrape   │ │ scrape       │  │
+│  │ ↓        │ │ ↓        │ │ ↓        │ │ ↓            │  │
+│  │ move     │ │ move     │ │ move     │ │ move         │  │
+│  └────┬─────┘ └────┬─────┘ └────┬─────┘ └──────┬───────┘  │
+│       │             │            │               │          │
+│       ▼             ▼            ▼               ▼          │
+│  novels.db     blogs.db    medium.db ◄──── raindrop.db     │
+│                                  ▲     Medium URL routing   │
+│       │             │            │               │          │
+│       ▼             ▼            ▼               ▼          │
+│  ┌──────────────────────────────────────────────────────┐  │
+│  │            Obsidian Vault (Clippings/)                │  │
+│  │  Novels/  │  Databricks/  │  Medium/  │  Raindrop/   │  │
+│  └──────────────────────────────────────────────────────┘  │
+│                                                             │
+│  ──► sync.log (timestamped summary + full output)          │
+│  ──► Discord webhook (optional)                            │
+└─────────────────────────────────────────────────────────────┘
+
+All 4 pipelines run in parallel (bash & + wait).
+Each pipeline has its own DuckDB file (required — DuckDB is single-writer).
+```
+
+### Pipeline Details
+
+| Pipeline | Strategy | Scrape Mode | Database |
+|----------|----------|-------------|----------|
+| Novels | **Conditional** — `check --json` first, skip if no new chapters | Sequential | `novels.db` |
+| Blogs | Unconditional — discover + scrape + move every run | Parallel (4 workers) | `blogs.db` |
+| Medium | Unconditional — discover + scrape + move every run | Parallel (4 workers) | `medium.db` |
+| Raindrop | Unconditional — discover + scrape + move every run | Parallel (4 workers) | `raindrop.db` |
+
+### Medium URL Routing (Cross-Pipeline)
+
+When Raindrop discovers a bookmark pointing to Medium (including custom domains like `towardsdatascience.com`):
+
+1. Raindrop marks it `skipped_medium` in `raindrop.db`
+2. Inserts a pending row directly into `medium.db`
+3. The Medium pipeline (running in parallel) picks it up during `scrape`
+4. Medium scraper uses auth cookies for full member-only content
+
+### Error Detection
+
+The script detects two categories of failure:
+
+- **Config errors** — missing API tokens, missing Obsidian vault paths → shown as `! missing config`
+- **Runtime errors** — scrape failures, network errors → shown as `✗ failed`
+
+Full error details are logged to `sync.log` and stored in each pipeline's database.
+
+## Interactive Output
+
+When run from a terminal, the script shows a live spinner with per-pipeline status:
+
+```
+Scraper Pipeline  2026-02-16 08:19:25
+
+  ⠹  – Novels  ✓ Blogs  … Medium  … Raindrop     ← live updates
+
+  –  Novels       no new chapters    0s
+  ✓  Blogs        done               2s
+  ✓  Medium       done               5s
+  ✓  Raindrop     done               3s
+
+Done in 5s — logged to sync.log
+```
+
+Status icons: `✓` done/synced, `–` no new content, `!` missing config, `✗` failed, `…` running.
+
+When run from launchd (non-interactive), all terminal output is suppressed — only `sync.log` is written.
+
+## Setup Guide
+
+### 1. Configure Each Pipeline
+
+Each pipeline needs its Obsidian vault path. All configs are saved in `config.local.toml` (gitignored).
+
+```bash
+# Novels — where to move downloaded chapters
+uv run python scrape_novels.py config set obsidian_vault "/path/to/vault/Novels"
+
+# Blogs — where to move Databricks blog posts
+uv run python scrape_blogs.py config set obsidian_vault "/path/to/vault/Clippings"
+
+# Medium — where to move Medium posts
+uv run python scrape_medium.py config set obsidian_vault "/path/to/vault/Clippings"
+
+# Raindrop — where to move scraped bookmarks
+uv run python scrape_raindrop.py config set obsidian_vault "/path/to/vault/Clippings"
+```
+
+### 2. Set API Tokens / Auth
+
+```bash
+# Raindrop — required (get from https://app.raindrop.io/settings/integrations)
+uv run python scrape_raindrop.py config set test_token "YOUR_TEST_TOKEN"
+
+# Medium — optional but recommended for member-only content
+# Get cookies from Chrome → F12 → Application → Cookies → medium.com
+uv run python scrape_medium.py config set sid "YOUR_SID_COOKIE"
+uv run python scrape_medium.py config set uid "YOUR_UID_COOKIE"
+```
+
+### 3. Add Content Sources
+
+```bash
+# Add novels to track
+uv run python scrape_novels.py add --url "https://..." --name "Novel Name"
+
+# Add Medium users to track
+uv run python scrape_medium.py add-user USERNAME
+```
+
+Blogs (Databricks) and Raindrop discover content automatically — no sources to add manually.
+
+### 4. Test Run
+
+```bash
+./sync_all.sh
+```
+
+### 5. Schedule with launchd (Daily at 3 AM)
+
+```bash
+# Install
+cp com.scraper.sync.plist ~/Library/LaunchAgents/
+launchctl load ~/Library/LaunchAgents/com.scraper.sync.plist
+
+# Verify it's loaded
+launchctl list | grep scraper
+
+# Trigger manually to test
+launchctl start com.scraper.sync
+
+# Uninstall
+launchctl unload ~/Library/LaunchAgents/com.scraper.sync.plist
+rm ~/Library/LaunchAgents/com.scraper.sync.plist
+```
+
+launchd automatically runs missed jobs after wake from sleep.
+
+### 6. Discord Notifications (Optional)
+
+Create `.env.local` (gitignored):
+
+```bash
+DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/..."
+```
+
+The script sends a one-line summary to the webhook after each run.
+
+## Log Files
+
+| File | Contents | Gitignored |
+|------|----------|------------|
+| `sync.log` | Timestamped summary + full pipeline output | Yes |
+| `sync_launchd.log` | stdout/stderr captured by launchd | Yes |
+
+## Troubleshooting
+
+### Check pipeline status
+
+```bash
+uv run python scrape_novels.py list
+uv run python scrape_blogs.py status
+uv run python scrape_medium.py status
+uv run python scrape_raindrop.py status
+```
+
+### Inspect Raindrop failures
+
+```bash
+uv run python scrape_raindrop.py fix           # human-readable
+uv run python scrape_raindrop.py fix --json    # machine-readable
+uv run python scrape_raindrop.py retry         # reset failed → pending
+```
+
+### Medium cookies expired
+
+If Medium posts start returning preview-only content, refresh cookies:
+
+```bash
+# Get fresh sid/uid from Chrome → F12 → Application → Cookies → medium.com
+uv run python scrape_medium.py config set sid "NEW_SID"
+uv run python scrape_medium.py config set uid "NEW_UID"
+```
+
+### Why 4 separate databases?
+
+DuckDB is single-writer — only one process can write at a time. Separate `.db` files allow all 4 pipelines to run in parallel without blocking. The only cross-database write is Raindrop→Medium routing (inserting pending rows into `medium.db` during Raindrop's discover phase).

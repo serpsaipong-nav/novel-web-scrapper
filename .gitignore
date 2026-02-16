@@ -27,3 +27,10 @@ novels.db
 blogs.db
 medium.db
 raindrop.db
+
+# Sync logs
+sync.log
+sync_launchd.log
+
+# Local environment
+.env.local
