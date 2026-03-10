@@ -22,11 +22,12 @@ wheels/
 # Local config (machine-specific)
 config.local.toml
 
-# Database
-novels.db
+# Database (novels.db tracked; others ignored or too large for git)
 blogs.db
 medium.db
 raindrop.db
+docs.db
+docs.db.wal
 
 # Sync logs
 sync.log
