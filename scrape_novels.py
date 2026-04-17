@@ -466,6 +466,48 @@ class NovelScraper:
         folder_name = self.get_folder_name(novel_name)
         return f"{chapter_num:04d}_-_{folder_name.replace(' ', '_')}"
 
+    def get_index_wikilink_name(self, novel_name):
+        folder_name = self.get_folder_name(novel_name)
+        return f"{folder_name.replace(' ', '_')}_Index"
+
+    NAV_MARKER = "<!-- nav-footer -->"
+
+    def strip_nav_footer(self, content):
+        pattern = re.compile(r'\n\n---\n\n' + re.escape(self.NAV_MARKER) + r'\n[^\n]*\n?$')
+        return pattern.sub('', content).rstrip('\n')
+
+    def build_nav_footer(self, novel_name, chapter_nums, i):
+        index_wikilink = self.get_index_wikilink_name(novel_name)
+        prev_link = (
+            f"[[{self.get_wikilink_name(novel_name, chapter_nums[i-1])}|← Ch {chapter_nums[i-1]}]]"
+            if i > 0 else "*(first)*"
+        )
+        next_link = (
+            f"[[{self.get_wikilink_name(novel_name, chapter_nums[i+1])}|Ch {chapter_nums[i+1]} →]]"
+            if i < len(chapter_nums) - 1 else "*(last)*"
+        )
+        index_link = f"[[{index_wikilink}|Index]]"
+        return f"\n\n---\n\n{self.NAV_MARKER}\n{prev_link} | {index_link} | {next_link}\n"
+
+    def update_chapter_navigation(self, novel_name, chapter_nums, target_dir=None):
+        """Add/update prev/next/index nav footer on all chapter files in target_dir."""
+        folder_name = self.get_folder_name(novel_name)
+        base = Path(target_dir) if target_dir else Path(self.output_dir)
+        novel_dir = base / folder_name
+
+        if not novel_dir.exists():
+            return
+
+        chapter_nums = sorted(chapter_nums)
+        for i, num in enumerate(chapter_nums):
+            filepath = novel_dir / self.get_chapter_filename(novel_name, num)
+            if not filepath.exists():
+                continue
+            content = filepath.read_text(encoding='utf-8')
+            content = self.strip_nav_footer(content)
+            content += self.build_nav_footer(novel_name, chapter_nums, i)
+            filepath.write_text(content, encoding='utf-8')
+
     def save_chapter(self, novel_name, chapter_num, title, content):
         """Save chapter in Obsidian format"""
         folder_name = self.get_folder_name(novel_name)
@@ -640,7 +682,7 @@ class LightNovelTranslationsScraper(NovelScraper):
 
                     # Get content
                     content = ""
-                    for selector in [".entry-content", ".post-content", ".chapter-content", "article"]:
+                    for selector in [".text_story", ".entry-content", ".post-content", ".chapter-content", "article"]:
                         elem = soup.select_one(selector)
                         if elem:
                             paragraphs = elem.find_all('p')
@@ -837,11 +879,196 @@ class NovelBinScraper(NovelScraper):
         return None, None
 
 
+class WebNovelScraper(NovelScraper):
+    """Scraper for webnovel.com using Playwright (site is fully JS-rendered).
+
+    Free chapters are scraped via API interception; locked/VIP chapters return
+    (None, None) and are silently skipped.
+    """
+
+    SITE = 'webnovel.com'
+    BASE_URL = 'https://www.webnovel.com'
+
+    @staticmethod
+    def _sync_playwright():
+        try:
+            from playwright.sync_api import sync_playwright
+            return sync_playwright
+        except ImportError:
+            raise RuntimeError(
+                "Playwright is required for webnovel.com. "
+                "Run: uv run playwright install chromium"
+            )
+
+    def get_chapter_list(self, novel_slug):
+        """Load catalog page via Playwright, intercept API response for chapter list."""
+        sync_playwright = self._sync_playwright()
+        chapters = []
+
+        try:
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=True)
+                page = browser.new_page()
+                captured = []
+
+                def on_response(response):
+                    try:
+                        if response.status == 200 and response.request.resource_type in ('xhr', 'fetch'):
+                            data = response.json()
+                            if isinstance(data, dict) and 'volumeItems' in str(data):
+                                captured.append(data)
+                    except Exception:
+                        pass
+
+                page.on('response', on_response)
+                page.goto(
+                    f"{self.BASE_URL}/book/{novel_slug}/catalog",
+                    wait_until='load', timeout=60000
+                )
+                # Wait for chapter data to appear (API call completes after initial load)
+                try:
+                    page.wait_for_function(
+                        "() => document.querySelector('[class*=\"chapter\"]') !== null",
+                        timeout=15000
+                    )
+                except Exception:
+                    pass
+
+                # Parse from intercepted API response
+                for data in captured:
+                    for volume in data.get('data', {}).get('volumeItems', []):
+                        for ch in volume.get('chapterItems', []):
+                            ch_id = str(ch.get('id', ''))
+                            ch_index = ch.get('index', 0)
+                            if ch_id and ch_index:
+                                chapters.append({
+                                    'num': ch_index,
+                                    'url': f"{self.BASE_URL}/book/{novel_slug}/{ch_id}",
+                                    'title': ch.get('name', f"Chapter {ch_index}"),
+                                })
+
+                # DOM fallback: look for rendered chapter links
+                if not chapters:
+                    try:
+                        links = page.eval_on_selector_all(
+                            'a[href*="/book/"]',
+                            'els => els.map(e => ({href: e.href, text: e.innerText.trim()}))'
+                        )
+                        for link in links:
+                            href = link.get('href', '')
+                            text = link.get('text', '')
+                            ch_match = re.search(r'/book/\d+/(\d+)', href)
+                            num_match = re.search(r'[Cc]hapter\s*(\d+)', text)
+                            if ch_match and num_match:
+                                chapters.append({
+                                    'num': int(num_match.group(1)),
+                                    'url': href,
+                                    'title': text or f"Chapter {num_match.group(1)}",
+                                })
+                    except Exception:
+                        pass
+
+                browser.close()
+        except Exception as e:
+            print(f"Error fetching chapter list: {e}")
+
+        chapters.sort(key=lambda x: x['num'])
+        seen: set = set()
+        return [ch for ch in chapters if not (ch['num'] in seen or seen.add(ch['num']))]
+
+    def scrape_chapter_by_url(self, url, retries=None):
+        """Render chapter page via Playwright; extract from API intercept or DOM."""
+        sync_playwright = self._sync_playwright()
+        retries = retries or self.config.max_retries
+
+        for attempt in range(retries):
+            try:
+                with sync_playwright() as p:
+                    browser = p.chromium.launch(headless=True)
+                    page = browser.new_page()
+                    captured = []
+
+                    def on_response(response):
+                        try:
+                            if response.status == 200 and response.request.resource_type in ('xhr', 'fetch'):
+                                data = response.json()
+                                if isinstance(data, dict) and data.get('code') == 0 and 'chapterInfo' in str(data):
+                                    captured.append(data)
+                        except Exception:
+                            pass
+
+                    page.on('response', on_response)
+                    page.goto(url, wait_until='load', timeout=60000)
+                    # Wait for chapter content to render
+                    try:
+                        page.wait_for_selector('.cha-words, .chapter-content', timeout=15000)
+                    except Exception:
+                        pass
+
+                    title = 'Chapter'
+                    content = ''
+
+                    if captured:
+                        ch_info = captured[0].get('data', {}).get('chapterInfo', {})
+                        title = ch_info.get('chapterName', 'Chapter')
+                        content = '\n\n'.join(
+                            item.get('content', '').strip()
+                            for item in ch_info.get('contents', [])
+                            if item.get('content', '').strip()
+                        )
+                    else:
+                        # DOM fallback
+                        try:
+                            page.wait_for_selector('.cha-words, .chapter-content', timeout=15000)
+                        except Exception:
+                            pass
+
+                        for sel in ['h3.cha-tit', '.chapter-title h3', 'h1']:
+                            elem = page.query_selector(sel)
+                            if elem:
+                                title = elem.inner_text().strip()
+                                break
+
+                        for sel in ['.cha-words p', '.cha-content p', '.chapter-content p']:
+                            elems = page.query_selector_all(sel)
+                            if elems:
+                                parts = [e.inner_text().strip() for e in elems if len(e.inner_text().strip()) > 15]
+                                if parts:
+                                    content = '\n\n'.join(parts)
+                                    break
+
+                    browser.close()
+
+                    if content and len(content) > 50:
+                        return title, content
+                    # Locked/VIP chapter — skip silently
+                    return None, None
+
+            except Exception:
+                if attempt < retries - 1:
+                    time.sleep(2)
+
+        return None, None
+
+    def get_novel_status(self, novel_slug):
+        # Meta description from catalog page is available without JS
+        try:
+            r = self.scraper.get(f"{self.BASE_URL}/book/{novel_slug}/catalog", timeout=30)
+            if r.status_code == 200:
+                m = re.search(r'<meta name="description"[^>]*content="([^"]*)"', r.text)
+                if m and 'complet' in m.group(1).lower():
+                    return 'completed'
+        except Exception:
+            pass
+        return 'ongoing'
+
+
 # Scraper registry
 SCRAPERS = {
     'lightnovelstranslations.com': LightNovelTranslationsScraper,
     'freewebnovel.com': FreeWebNovelScraper,
     'novelbin.com': NovelBinScraper,
+    'webnovel.com': WebNovelScraper,
 }
 
 
@@ -866,6 +1093,10 @@ def extract_slug_from_url(url, site):
         return slug
     elif 'novelbin.com' in site:
         match = re.search(r'/b/([^/]+)', url)
+        return match.group(1) if match else None
+    elif 'webnovel.com' in site:
+        # URL: https://www.webnovel.com/book/title_BOOKID
+        match = re.search(r'_(\d+)(?:/|$)', url)
         return match.group(1) if match else None
     return None
 
@@ -1039,12 +1270,13 @@ class NovelManager:
         else:
             successful, failed = self._download_sequential(scraper, novel, new_chapters)
 
-        # Create index
+        # Create index and update navigation
         if successful > 0:
             with self.db:
                 all_chapters = self.db.get_chapters(novel['id'])
                 chapter_nums = [c['chapter_num'] for c in all_chapters]
             scraper.create_index_file(novel['name'], chapter_nums)
+            scraper.update_chapter_navigation(novel['name'], chapter_nums)
 
         # Log sync
         with self.db:
@@ -1190,6 +1422,13 @@ class NovelManager:
         with self.db:
             self.db.mark_chapters_moved(novel['id'], moved)
 
+        # Rebuild nav in vault for all chapters (covers boundary prev/next after new batch)
+        with self.db:
+            all_chapters = self.db.get_chapters(novel['id'])
+            all_chapter_nums = [c['chapter_num'] for c in all_chapters]
+        scraper = NovelScraper(self.config)
+        scraper.update_chapter_navigation(novel['name'], all_chapter_nums, target_dir=obsidian_path)
+
         print(f"Moved {len(moved)} chapters to Obsidian: {novel['name']}")
 
     def scan_obsidian(self):
@@ -1261,6 +1500,42 @@ class NovelManager:
             imported_novels += 1
 
         print(f"\nImported: {imported_novels} novels, {imported_chapters} chapters")
+
+    def nav_update(self, name=None, all_novels=False, vault=False):
+        """Rebuild prev/next/index navigation for chapters in staging or vault."""
+        target_dir = None
+        if vault:
+            obsidian_path = self.config.obsidian_vault
+            if not obsidian_path:
+                print("Error: Obsidian vault path not configured")
+                return
+            target_dir = str(Path(obsidian_path).expanduser())
+
+        with self.db:
+            if all_novels:
+                novels = self.db.list_novels()
+            elif name:
+                novel = self.db.get_novel(name=name)
+                if not novel:
+                    print(f"Error: Novel '{name}' not found")
+                    return
+                novels = [novel]
+            else:
+                print("Error: Specify --name or --all")
+                return
+
+        scraper = NovelScraper(self.config)
+        for novel in novels:
+            with self.db:
+                chapters = self.db.get_chapters(novel['id'])
+            chapter_nums = [c['chapter_num'] for c in chapters]
+            if not chapter_nums:
+                print(f"No chapters tracked for: {novel['name']}")
+                continue
+            scraper.create_index_file(novel['name'], chapter_nums)
+            scraper.update_chapter_navigation(novel['name'], chapter_nums, target_dir=target_dir)
+            location = f"vault ({target_dir})" if vault else "staging"
+            print(f"Updated nav for {novel['name']}: {len(chapter_nums)} chapters [{location}]")
 
 
 # =============================================================================
@@ -1402,6 +1677,12 @@ Examples:
     # Scan Obsidian command
     scan_parser = subparsers.add_parser('scan-obsidian', help='Import existing novels from Obsidian')
 
+    # Nav update command
+    nav_parser = subparsers.add_parser('nav-update', help='Rebuild prev/next/index nav on chapter files')
+    nav_parser.add_argument('--name', '-n', help='Novel name')
+    nav_parser.add_argument('--all', action='store_true', help='Update all novels')
+    nav_parser.add_argument('--vault', action='store_true', help='Target Obsidian vault (default: staging)')
+
     # Config command
     config_parser = subparsers.add_parser('config', help='View/set configuration')
     config_parser.add_argument('action', choices=['show', 'set'], help='Action')
@@ -1460,6 +1741,10 @@ Examples:
     elif args.command == 'scan-obsidian':
         manager = NovelManager(config)
         manager.scan_obsidian()
+
+    elif args.command == 'nav-update':
+        manager = NovelManager(config)
+        manager.nav_update(name=args.name, all_novels=args.all, vault=args.vault)
 
     elif args.command == 'config':
         if args.action == 'show':
