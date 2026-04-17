@@ -462,9 +462,9 @@ class NovelScraper:
         return f"{chapter_num:04d} - {folder_name}.md"
 
     def get_wikilink_name(self, novel_name, chapter_num):
-        """Get wikilink format: 0001_-_Novel_Name"""
+        """Get wikilink format: 0001 - Novel Name"""
         folder_name = self.get_folder_name(novel_name)
-        return f"{chapter_num:04d}_-_{folder_name.replace(' ', '_')}"
+        return f"{chapter_num:04d} - {folder_name}"
 
     def get_index_wikilink_name(self, novel_name):
         folder_name = self.get_folder_name(novel_name)

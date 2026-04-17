@@ -19,7 +19,7 @@ NAV_MARKER = "<!-- nav-footer -->"
 
 
 def get_wikilink_name(folder_name: str, chapter_num: int) -> str:
-    return f"{chapter_num:04d}_-_{folder_name.replace(' ', '_')}"
+    return f"{chapter_num:04d} - {folder_name}"
 
 
 def get_index_wikilink_name(folder_name: str) -> str:
